@@ -134,7 +134,7 @@ struct MenuContent: View {
                         .labelsHidden()
                 }
 
-                Text("报警时自动保存画面与数据，供分析误报；漏报可用下方按钮手动记录。")
+                Text("报警时自动保存画面与数据，供分析误报；漏报可用下方按钮手动记录。仅保留最近 10 条。")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)

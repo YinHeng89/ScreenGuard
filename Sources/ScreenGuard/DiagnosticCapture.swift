@@ -14,6 +14,9 @@ final class DiagnosticCapture: @unchecked Sendable {
     private let fileManager = FileManager.default
     private(set) var rootURL: URL?
 
+    /// 最多保留的快照组数，超出后自动清理最旧的（每组 = 同名 PNG + JSON）
+    private let maxSnapshots = 10
+
     /// 诊断捕获开关，默认开启。存 UserDefaults，菜单栏可切换。
     var isEnabled: Bool {
         get { UserDefaults.standard.object(forKey: "diagnosticCaptureEnabled") as? Bool ?? true }
@@ -65,6 +68,26 @@ final class DiagnosticCapture: @unchecked Sendable {
             ) {
                 try? data.write(to: root.appendingPathComponent("\(base).json"))
             }
+
+            // 滚动清理：时间戳前缀即字典序，保留最新 maxSnapshots 组，删除更旧的
+            self.pruneOldSnapshots(in: root)
+        }
+    }
+
+    /// 保留最新的 N 组快照，删除其余的 PNG 与 JSON。
+    /// 文件名以 "yyyy-MM-dd_HH-mm-ss.SSS_reason" 开头，字典序等于时间序。
+    private func pruneOldSnapshots(in root: URL) {
+        let names = (try? fileManager.contentsOfDirectory(atPath: root.path)) ?? []
+        // 以去掉扩展名后的 base 为一组（PNG 与 JSON 同名）
+        var bases = Set<String>()
+        for name in names where name.hasSuffix(".png") || name.hasSuffix(".json") {
+            bases.insert((name as NSString).deletingPathExtension)
+        }
+        let sorted = bases.sorted()   // 旧 → 新
+        guard sorted.count > maxSnapshots else { return }
+        for base in sorted.prefix(sorted.count - maxSnapshots) {
+            try? fileManager.removeItem(at: root.appendingPathComponent(base + ".png"))
+            try? fileManager.removeItem(at: root.appendingPathComponent(base + ".json"))
         }
     }
 

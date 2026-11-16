@@ -237,6 +237,7 @@ A temporary feature built for tuning. On each alert it saves the camera frame pl
 
 - Location: `~/Library/Application Support/ScreenGuard/Diagnostics/`
 - Each snapshot = a `PNG` (frame) + a `JSON` (data) with matching names
+- Automatic rolling cleanup: **only the latest 10 snapshots are kept**; older ones are removed on the next save — no manual maintenance needed
 - **Auto snapshot**: saved on alert, for analyzing false positives
 - **Record current**: manual button, for analyzing missed detections (hand touched but no alert)
 - JSON includes: risk, threshold, six features, dual confidences, occlusion retention, gate state, scale history, track details
