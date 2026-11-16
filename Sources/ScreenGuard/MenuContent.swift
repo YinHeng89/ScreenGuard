@@ -12,6 +12,10 @@ struct MenuContent: View {
     @AppStorage("cooldownSeconds") private var cooldownSeconds = 5
     @AppStorage("selectedCameraID") private var selectedCameraID = ""
     @AppStorage("reminderCount") private var reminderCount = 0
+    // 三路信号开关：关掉的通道不计分，权重按比例分给其余开启项
+    @AppStorage("signalGrowthEnabled") private var growthEnabled = true
+    @AppStorage("signalGestureEnabled") private var gestureEnabled = true
+    @AppStorage("signalZoneEnabled") private var zoneEnabled = true
     // 诊断快照开关（临时功能，后期可整体删除）
     @AppStorage("diagnosticCaptureEnabled") private var diagnosticEnabled = true
 
@@ -24,7 +28,7 @@ struct MenuContent: View {
 
             HStack(spacing: 8) {
                 Text("检测强度")
-                    .font(.caption2)
+                    .font(.system(size: 11))
                     .foregroundStyle(.secondary)
 
                 GeometryReader { geo in
@@ -45,57 +49,70 @@ struct MenuContent: View {
                 .frame(height: 4)
 
                 Text("\(Int(detector.detectionStrength * 100))%")
-                    .font(.caption2)
+                    .font(.system(size: 11))
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
                     .frame(width: 30, alignment: .trailing)
             }
 
-            HStack(spacing: 5) {
-                signalTag("食指伸出", active: detector.indexExtended, color: .purple)
-                signalTag("正在靠近", active: detector.approaching, color: .orange)
-                signalTag("接近区", active: detector.detectionStrength > 0.6, color: .pink)
+            VStack(alignment: .leading, spacing: 6) {
+                Text("参与评分的信号")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.tertiary)
+
+                VStack(spacing: 7) {
+                    signalRow("食指伸出", isOn: $gestureEnabled)
+                        .onChange(of: gestureEnabled) { _, _ in
+                            if !growthEnabled && !gestureEnabled && !zoneEnabled { gestureEnabled = true }
+                        }
+                    signalRow("正在靠近", isOn: $growthEnabled)
+                        .onChange(of: growthEnabled) { _, _ in
+                            if !growthEnabled && !gestureEnabled && !zoneEnabled { growthEnabled = true }
+                        }
+                    signalRow("接近区", isOn: $zoneEnabled)
+                        .onChange(of: zoneEnabled) { _, _ in
+                            if !growthEnabled && !gestureEnabled && !zoneEnabled { zoneEnabled = true }
+                        }
+                }
+
+                Text("关闭某路信号后，其权重分给其余项；关掉「正在靠近」将不再要求手持续变大。")
+                    .font(.system(size: 9.5))
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             Divider()
 
-            Toggle(isOn: $monitoringEnabled) {
-                Label("开启手势监测", systemImage: "waveform.path.ecg")
-            }
-            .onChange(of: monitoringEnabled) { _, enabled in
-                if enabled {
-                    detector.start(deviceID: selectedCameraID)
-                } else {
-                    detector.stop()
+            settingToggle("开启手势监测", icon: "waveform.path.ecg", isOn: $monitoringEnabled)
+                .onChange(of: monitoringEnabled) { _, enabled in
+                    if enabled {
+                        detector.start(deviceID: selectedCameraID)
+                    } else {
+                        detector.stop()
+                    }
                 }
-            }
 
-            Picker("灵敏度", selection: $sensitivity) {
+            settingPicker("灵敏度", selection: $sensitivity) {
                 Text("保守").tag(0)
                 Text("标准").tag(1)
                 Text("灵敏").tag(2)
             }
-            .pickerStyle(.menu)
 
-            Picker("提醒间隔", selection: $cooldownSeconds) {
+            settingPicker("提醒间隔", selection: $cooldownSeconds) {
                 Text("3 秒").tag(3)
                 Text("5 秒").tag(5)
                 Text("8 秒").tag(8)
                 Text("12 秒").tag(12)
             }
-            .pickerStyle(.menu)
 
-            Toggle(isOn: $soundEnabled) {
-                Label("提示音", systemImage: "speaker.wave.2")
-            }
+            settingToggle("提示音", icon: "speaker.wave.2", isOn: $soundEnabled)
 
-            Picker("摄像头", selection: $selectedCameraID) {
+            settingPicker("摄像头", selection: $selectedCameraID) {
                 Text("自动选择").tag("")
                 ForEach(cameras, id: \.uniqueID) { device in
                     Text(device.localizedName).tag(device.uniqueID)
                 }
             }
-            .pickerStyle(.menu)
             .onChange(of: selectedCameraID) { _, newID in
                 guard monitoringEnabled else { return }
                 detector.stop()
@@ -110,32 +127,23 @@ struct MenuContent: View {
                 } label: {
                     Label("预览提醒", systemImage: "eye")
                 }
-                .buttonStyle(.borderless)
+                .buttonStyle(.plain)
 
                 Spacer()
 
                 Text("已提醒 \(reminderCount) 次")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
             }
 
             // MARK: 诊断快照（临时功能，后期可删除整个分区）
             Divider()
 
             VStack(alignment: .leading, spacing: 6) {
-                HStack {
-                    Label("诊断快照", systemImage: "doc.camera")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Toggle("", isOn: $diagnosticEnabled)
-                        .toggleStyle(.switch)
-                        .controlSize(.mini)
-                        .labelsHidden()
-                }
+                settingToggle("诊断快照", icon: "doc.camera", isOn: $diagnosticEnabled)
 
                 Text("报警时自动保存画面与数据，供分析误报；漏报可用下方按钮手动记录。仅保留最近 10 条。")
-                    .font(.caption2)
+                    .font(.system(size: 9.5))
                     .foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)
 
@@ -146,19 +154,19 @@ struct MenuContent: View {
                     } label: {
                         Label("记录当前", systemImage: "camera")
                     }
-                    .buttonStyle(.borderless)
+                    .buttonStyle(.plain)
 
                     Button {
                         DiagnosticCapture.shared.reveal()
                     } label: {
                         Label("打开文件夹", systemImage: "folder")
                     }
-                    .buttonStyle(.borderless)
+                    .buttonStyle(.plain)
 
                     Spacer()
 
                     Text("\(snapshotCount) 张")
-                        .font(.caption2)
+                        .font(.system(size: 10))
                         .monospacedDigit()
                         .foregroundStyle(.tertiary)
                 }
@@ -169,16 +177,23 @@ struct MenuContent: View {
             } label: {
                 Label("退出 ScreenGuard", systemImage: "power")
             }
-            .buttonStyle(.borderless)
+            .buttonStyle(.plain)
 
             Text("画面仅在本机分析 · 存储于本机 · 不上传")
-                .font(.caption2)
+                .font(.system(size: 9.5))
                 .foregroundStyle(.tertiary)
                 .frame(maxWidth: .infinity, alignment: .center)
                 .padding(.top, 1)
         }
-        .padding(14)
-        .frame(width: 288)
+        .font(.system(size: 11))
+        .tint(.accentColor)
+        // 留白加大，整体更舒展
+        .padding(.horizontal, 20)
+        .padding(.vertical, 18)
+        .frame(width: 320)
+        // 内容层实色背景 + 桥接视图：后者随面板加入窗口时，把系统半透明材质改为不透明
+        .background(Color(nsColor: .windowBackgroundColor))
+        .background(MenuPanelBackgroundFixer())
         .onAppear {
             cameras = discoverCameras()
             snapshotCount = DiagnosticCapture.shared.count
@@ -198,9 +213,9 @@ struct MenuContent: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 Text("屏幕守卫")
-                    .font(.system(size: 14, weight: .semibold))
+                    .font(.system(size: 13, weight: .semibold))
                 Text("\(detector.statusText) · \(detector.stateText)")
-                    .font(.system(size: 11))
+                    .font(.system(size: 10))
                     .foregroundStyle(.secondary)
             }
 
@@ -213,15 +228,51 @@ struct MenuContent: View {
         }
     }
 
-    private func signalTag(_ title: String, active: Bool, color: Color) -> some View {
-        Text(title)
-            .font(.system(size: 9.5, weight: .medium))
-            .padding(.horizontal, 7)
-            .padding(.vertical, 3)
-            .background(
-                Capsule().fill(active ? color.opacity(0.22) : Color.secondary.opacity(0.10))
-            )
-            .foregroundStyle(active ? color : .secondary)
+    /// 统一的行内开关：左侧图标+文字，右侧迷你 switch 右对齐。
+    private func settingToggle(_ title: String, icon: String, isOn: Binding<Bool>) -> some View {
+        HStack {
+            Label(title, systemImage: icon)
+                .font(.system(size: 11.5))
+            Spacer(minLength: 8)
+            Toggle("", isOn: isOn)
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .labelsHidden()
+        }
+    }
+
+    /// 统一的下拉项：左侧标签，右侧菜单式选择器，选中值右对齐并弱化。
+    private func settingPicker<Content: View, Selection: Hashable>(
+        _ title: String,
+        selection: Binding<Selection>,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        HStack {
+            Text(title)
+                .font(.system(size: 11.5))
+            Spacer(minLength: 8)
+            Picker("", selection: selection) { content() }
+                .pickerStyle(.menu)
+                .labelsHidden()
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+        }
+        .frame(height: 18)
+    }
+
+    /// 单个信号：左右结构，文字在前、迷你 switch 在后，右对齐。
+    private func signalRow(_ title: String, isOn: Binding<Bool>) -> some View {
+        HStack {
+            Text(title)
+                .font(.system(size: 11))
+                .foregroundStyle(isOn.wrappedValue ? .primary : .tertiary)
+                .lineLimit(1)
+            Spacer(minLength: 8)
+            Toggle("", isOn: isOn)
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .labelsHidden()
+        }
     }
 
     private func discoverCameras() -> [AVCaptureDevice] {

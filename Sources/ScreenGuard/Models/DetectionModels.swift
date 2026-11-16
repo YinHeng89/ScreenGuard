@@ -80,23 +80,42 @@ struct RiskAssessment {
     )
 }
 
-/// 六类归一化特征，对应风险评分公式的分量。
-/// growth（尺度持续增长）是本系统的核心前提：只有手正在变大/靠近才应报警。
+/// 参与风险评分的归一化特征。
+/// growth（尺度持续增长）是核心前提：只有手正在变大/靠近才应报警。
+/// velocity 仍会采集并写入诊断 JSON，但不再参与评分——关键点差分在 30fps 下抖动过大。
 struct FeatureSet {
-    /// 运动方向与目标屏幕区域的匹配程度
+    /// 运动方向与目标屏幕区域的匹配程度（弱辅助，避免把抖动当成意图）
     var direction: CGFloat = 0
-    /// 接近运动的速度特征
+    /// 接近运动的速度（仅诊断展示，不参与评分）
     var velocity: CGFloat = 0
-    /// 手臂伸展程度
-    var armExtension: CGFloat = 0
-    /// 手部姿态与触碰动作的匹配程度
+    /// 手部姿态与触碰动作的匹配程度（辅助）
     var gesture: CGFloat = 0
-    /// 与屏幕危险区域的空间关系（静态位置，权重刻意压低）
+    /// 与屏幕危险区域的空间关系
     var zone: CGFloat = 0
     /// 手部尺度的持续增长趋势：越大表示越靠近，报警的必要前提
     var growth: CGFloat = 0
 
     static let empty = FeatureSet()
+}
+
+/// 三路可开关的信号。关掉某一路后，它的权重按比例分给其余开启项。
+/// 开关状态存 UserDefaults，菜单里点击即时生效。
+struct SignalSettings {
+    /// 正在靠近（尺度增长 + 运动方向）。关闭后不再要求手持续变大，误报会上升。
+    var growth: Bool
+    /// 食指伸出 / 张开手掌
+    var gesture: Bool
+    /// 是否进入画面危险区
+    var zone: Bool
+
+    static var current: SignalSettings {
+        let defaults = UserDefaults.standard
+        return SignalSettings(
+            growth: defaults.object(forKey: "signalGrowthEnabled") as? Bool ?? true,
+            gesture: defaults.object(forKey: "signalGestureEnabled") as? Bool ?? true,
+            zone: defaults.object(forKey: "signalZoneEnabled") as? Bool ?? true
+        )
+    }
 }
 
 // MARK: - CGPoint 便捷运算

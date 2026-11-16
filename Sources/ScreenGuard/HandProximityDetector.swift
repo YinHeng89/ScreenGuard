@@ -20,9 +20,6 @@ final class HandProximityDetector: NSObject, ObservableObject {
         request.maximumHandCount = 2
         return request
     }()
-    private lazy var bodyRequest: VNDetectHumanBodyPoseRequest = {
-        VNDetectHumanBodyPoseRequest()
-    }()
 
     // MARK: - 检测模块
 
@@ -50,6 +47,7 @@ final class HandProximityDetector: NSObject, ObservableObject {
     @Published private(set) var detectionStrength: CGFloat = 0
     @Published private(set) var indexExtended = false
     @Published private(set) var approaching = false
+    @Published private(set) var zoneStrength: CGFloat = 0
     @Published private(set) var stateText = "待机"
     @Published private(set) var statusText = "未启动"
 
@@ -183,6 +181,7 @@ final class HandProximityDetector: NSObject, ObservableObject {
         detectionStrength = 0
         indexExtended = false
         approaching = false
+        zoneStrength = 0
         stateText = "待机"
         consecutiveErrors = 0
         // 诊断缓存与判定镜像都在 analysisQueue 内访问，清理也送回该队列
@@ -223,16 +222,6 @@ final class HandProximityDetector: NSObject, ObservableObject {
         }
         if (handRequest.results?.isEmpty ?? true) == false { consecutiveErrors = 0 }
 
-        var armExtension: CGFloat = 0
-        do {
-            try visionHandler.perform([bodyRequest], on: pixelBuffer, orientation: .up)
-            if let body = bodyRequest.results?.first {
-                armExtension = BodyPoseAnalyzer.armExtension(from: body)
-            }
-        } catch {
-            // 上肢分析失败不影响手部主流程
-        }
-
         // Layer 2：多目标追踪
         let tracks = tracker.update(with: handObservations, at: time)
         let hasObservation = tracker.hasLiveObservation(at: time)
@@ -254,18 +243,22 @@ final class HandProximityDetector: NSObject, ObservableObject {
             let speed = velocity.length
 
             features.direction = geometry.directionScore(velocity: velocity, at: anchor)
+            // 速度仅作诊断展示，不参与评分
             features.velocity = min(max(speed / 0.45, 0), 1)
-            features.armExtension = armExtension
             features.gesture = (indexExtended ? 0.65 : 0) + (palmOpen ? 0.35 : 0)
             features.zone = geometry.zoneScore(for: anchor)
             features.growth = tracker.scaleGrowth(for: track)
 
-            // 遮挡期的接近证据也以尺度增长为主，避免抬手瞬间被当成持续接近
-            riskHint = features.growth * 0.4 + features.direction * 0.2
-                + features.velocity * 0.15 + features.gesture * 0.15 + features.zone * 0.1
+            // 遮挡期证据同样遵循信号开关，并按开启项重新归一化
+            let signals = SignalSettings.current
+            let hintTotal: CGFloat = (signals.growth ? 0.7 : 0)
+                + (signals.zone ? 0.2 : 0) + (signals.gesture ? 0.1 : 0)
+            riskHint = ((signals.growth ? features.growth * 0.7 : 0)
+                + (signals.zone ? features.zone * 0.2 : 0)
+                + (signals.gesture ? features.gesture * 0.1 : 0))
+                / max(hintTotal, 0.0001)
         } else {
-            // 无观测时保留上肢与历史证据，不直接归零
-            features.armExtension = armExtension
+            // 无观测时不伪造风险，交给遮挡保留系数衰减
             riskHint = 0
         }
 
@@ -317,6 +310,7 @@ final class HandProximityDetector: NSObject, ObservableObject {
             self.detectionStrength = strength
             self.indexExtended = indexExtended
             self.approaching = approaching
+            self.zoneStrength = features.zone
             self.stateText = assessment.state.rawValue
             self.isClose = assessment.state == .alert
 
@@ -342,6 +336,12 @@ final class HandProximityDetector: NSObject, ObservableObject {
     ) -> [String: Any] {
         let f = assessment.features
         var meta: [String: Any] = [
+            "algorithm": "growth-first-v3",
+            "signals": [
+                "growth": SignalSettings.current.growth,
+                "gesture": SignalSettings.current.gesture,
+                "zone": SignalSettings.current.zone
+            ],
             "uptimeSec": time,
             "state": assessment.state.rawValue,
             "risk": assessment.risk,
@@ -353,7 +353,6 @@ final class HandProximityDetector: NSObject, ObservableObject {
             "occlusionRetention": retention,
             "feature_direction": f.direction,
             "feature_velocity": f.velocity,
-            "feature_armExtension": f.armExtension,
             "feature_gesture": f.gesture,
             "feature_zone": f.zone,
             "feature_growth": f.growth,

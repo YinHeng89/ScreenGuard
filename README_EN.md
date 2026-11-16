@@ -98,13 +98,12 @@ The app then lives in your menu bar as a hand icon: `✋` (monitoring) / `🚫` 
 
 ## How It Works
 
-ScreenGuard turns camera frames into an alert decision through a **five-layer detection pipeline**.
+ScreenGuard turns camera frames into an alert decision through a **layered detection pipeline**. This version has been simplified: only signals that actually drive the decision remain; the idle upper-body branch and the noisy velocity score have been removed.
 
 ```
 ┌─────────────────────────────────────────────┐
 │ Layer 1  Visual Perception                    │
 │  VNDetectHumanHandPoseRequest (up to 2 hands)  │
-│  VNDetectHumanBodyPoseRequest (upper body)     │
 └──────────────────┬──────────────────────────┘
                    ↓
 ┌─────────────────────────────────────────────┐
@@ -116,7 +115,7 @@ ScreenGuard turns camera frames into an alert decision through a **five-layer de
                    ↓
 ┌─────────────────────────────────────────────┐
 │ Layer 3  Motion & Intent Analysis              │
-│  Direction / velocity / gesture / zone / growth  │
+│  Growth / zone / gesture / direction (velocity diagnostic-only) │
 └──────────────────┬──────────────────────────┘
                    ↓
 ┌─────────────────────────────────────────────┐
@@ -128,8 +127,8 @@ ScreenGuard turns camera frames into an alert decision through a **five-layer de
                    ↓
 ┌─────────────────────────────────────────────┐
 │ Layer 5  Risk Decision — state machine          │
-│  Weighted features + hard growth gate + cooldown │
-│  + hysteresis                                   │
+│  Growth-first scoring + hard growth gate         │
+│  + cooldown + hysteresis                        │
 └─────────────────────────────────────────────┘
 ```
 
@@ -146,24 +145,24 @@ This is the single most important — and most iterated — rule in the system:
 | Hand held still in the air | Area barely changes | No |
 | Hand moving away from the camera | Negative growth | No |
 
-`HandTrackingEngine.scaleGrowth(for:)` examines the bounding-box area over the last 8 frames: it returns a positive growth score only if the area is more than 4% larger than the first frame and at least 60% of the steps are increases. `RiskEvaluator` then requires growth ≥ 0.22 for 2 consecutive frames before opening the gate. The gate is a **necessary condition** for `alert` — no matter how fast the motion or how gesture-like the pose, without the gate nothing fires.
+`HandTrackingEngine.scaleGrowth(for:)` examines the bounding-box area over the last 8 frames: it returns a positive growth score only if the area is more than 6% larger than the first frame, the absolute delta is at least 0.004, and at least 65% of the steps are increases. `RiskEvaluator` then requires growth ≥ 0.22 for 2 consecutive frames before opening the gate. The gate is a **necessary condition** for `alert` — no matter how fast the motion or how gesture-like the pose, without the gate nothing fires. The absolute-delta floor filters out "percentage growth" caused by keypoint jitter.
 
 ### Risk scoring
 
-Six normalized features are weighted (weights sum to 1):
+Only discriminative signals are scored (weights sum to 1):
 
 | Feature | Weight | Meaning |
 | --- | --- | --- |
-| `growth` | 0.32 | Is the hand continuously growing (the core prerequisite) |
-| `direction` | 0.20 | Is motion heading toward the screen region |
-| `velocity` | 0.14 | Approach speed |
-| `gesture` | 0.14 | Pointing / open-hand pose |
-| `arm` | 0.12 | Shoulder–elbow–wrist extension |
-| `zone` | 0.08 | Inside the lower danger zone (deliberately down-weighted) |
+| `growth` | 0.62 | Is the hand continuously growing (the core prerequisite, dominant) |
+| `zone` | 0.18 | Inside the lower danger zone |
+| `gesture` | 0.12 | Pointing / open-hand pose (weak aid) |
+| `direction` | 0.08 | Is motion heading toward the screen region (weak aid) |
 
-A front-facing camera usually can't see the full upper body, so `armExtension` is often 0 in typical seated use. When that happens, its weight is redistributed proportionally to the reliable features, avoiding an artificially raised threshold.
+`velocity` is still computed and written to the diagnostic JSON but **does not affect scoring**: at 30fps, a two-frame keypoint difference amplifies jitter into high speed, which was the main noise source behind false positives. The upper-body extension branch and its weight redistribution have been removed entirely, since the feature is constantly 0 in normal seated use.
 
-Thresholds by sensitivity: **Conservative 0.62 / Standard 0.48 / Sensitive 0.36**.
+**Three signal toggles**: the `Index extended` / `Approaching` / `Danger zone` tags in the menu are clickable switches mapped to `gesture` / `growth + direction` / `zone`. Turning one off zeroes its weight and re-normalizes the remaining enabled weights to sum to 1 — e.g. with `Danger zone` off, the weights become growth ≈0.76 / direction ≈0.10 / gesture ≈0.15. At least one signal must stay on. Note: turning off `Approaching` also disables the hard scale-growth gate, so alerts then rely only on zone and gesture and **false positives will rise noticeably**.
+
+Thresholds by sensitivity: **Conservative 0.62 / Standard 0.48 / Sensitive 0.36**. The confirmation window was tightened from 3 to 2 frames; strong growth inside the danger zone fires in a single frame so quick pokes are not missed.
 
 ### State machine
 
@@ -200,7 +199,6 @@ ScreenGuard/
 │   │   └── DetectionModels.swift          # HandTrack / state / assessment / features
 │   └── Detection/
 │       ├── HandPoseAnalyzer.swift         # Hand keypoints, index extension, palm openness
-│       ├── BodyPoseAnalyzer.swift         # Upper-body extension
 │       ├── HandTrackingEngine.swift       # Multi-target association, smoothing, scale growth
 │       ├── OcclusionPredictor.swift       # Occlusion risk hold / decay
 │       ├── ScreenGeometry.swift           # Normalized danger-zone model (calibratable)
@@ -221,7 +219,7 @@ Click the hand icon in the menu bar:
 | --- | --- |
 | Enable gesture monitoring | Master switch; turning it off stops the camera and clears state |
 | Detection strength bar | Live risk vs. threshold; turns orange/pink near trigger |
-| Signal tags | `Index extended` / `Approaching` / `Danger zone` — which signals are active |
+| Signal toggles | `Index extended` / `Approaching` / `Danger zone` — uniform mini switches that can be toggled both ways; weights are redistributed among enabled signals |
 | Sensitivity | Conservative / Standard / Sensitive |
 | Reminder interval | 3 / 5 / 8 / 12 seconds |
 | Sound | Toggle the soft Tink on trigger |
@@ -240,7 +238,7 @@ A temporary feature built for tuning. On each alert it saves the camera frame pl
 - Automatic rolling cleanup: **only the latest 10 snapshots are kept**; older ones are removed on the next save — no manual maintenance needed
 - **Auto snapshot**: saved on alert, for analyzing false positives
 - **Record current**: manual button, for analyzing missed detections (hand touched but no alert)
-- JSON includes: risk, threshold, six features, dual confidences, occlusion retention, gate state, scale history, track details
+- JSON includes: algorithm version, risk, threshold, growth/zone/gesture/direction features, velocity (diagnostic only), dual confidences, occlusion retention, gate state, scale history, track details
 
 **To remove entirely**: delete `DiagnosticCapture.swift` and the handful of call sites in `HandProximityDetector`, `MenuContent.swift`, and `main.swift`. Nothing else is affected. With the menu toggle off, nothing is written to disk.
 
@@ -281,7 +279,8 @@ swift -e 'import Foundation; DistributedNotificationCenter.default().postNotific
 | Parameter | File | Effect |
 | --- | --- | --- |
 | `growthGate` / `growthFramesNeeded` | `RiskEvaluator.swift` | Gate tightness: raise if false positives, lower if missed detections |
-| `weights` | `RiskEvaluator.swift` | Feature importance |
+| `weights` | `RiskEvaluator.swift` | Baseline feature weights; menu toggles re-normalize them |
+| `signal*Enabled` | `MenuContent.swift` / `DetectionModels.swift` | Persisted keys for the three signal toggles (editable from the menu) |
 | Three thresholds | `RiskEvaluator.swift` / `HandProximityDetector.swift` | Sensitivity levels |
 | `maxMissedFrames` | `HandTrackingEngine.swift` | Max frames of occlusion prediction |
 | `predictionWindow` | `OcclusionPredictor.swift` | Occlusion risk prediction window |
@@ -296,7 +295,7 @@ swift -e 'import Foundation; DistributedNotificationCenter.default().postNotific
 
 - **Camera blind spots**: the MacBook camera sits above the screen facing the user. Hands approaching from the side or below, or already touching the panel, may be invisible — and what the camera can't see can't be predicted. That's physics.
 - **Lighting and background**: low light, cluttered backgrounds, and strong backlight reduce Vision keypoint confidence.
-- **Upper-body feature**: a front camera usually frames only the upper half of the body, so `armExtension` is often 0 in normal seated posture; mitigated by weight redistribution.
+- **Velocity noise**: a two-frame keypoint difference is jittery during fast motion. Velocity is now diagnostic-only; if false positives persist, raise `growthGate` rather than restoring velocity weight.
 
 **Deliberately not implemented (to avoid piling on algorithms that obscure the source of false positives):**
 

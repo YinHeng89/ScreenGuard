@@ -90,23 +90,19 @@ final class HandTrackingEngine {
               let last = history.last else { return 0 }
 
         let baseline = max(first, 0.006)
+        // 绝对增量门槛：排除关键点抖动造成的「百分比增长」
+        guard last - baseline >= 0.004 else { return 0 }
         let relative = (last - baseline) / baseline
-        guard relative > 0.04 else { return 0 }
+        guard relative > 0.06 else { return 0 }
 
         var growthSteps = 0
         for i in 1..<history.count {
-            if history[i] > history[i - 1] * 1.008 { growthSteps += 1 }
+            if history[i] > history[i - 1] * 1.012 { growthSteps += 1 }
         }
         let continuity = CGFloat(growthSteps) / CGFloat(history.count - 1)
-        guard continuity >= 0.6 else { return 0 }
+        guard continuity >= 0.65 else { return 0 }
 
         return min(max(relative / 0.8, 0), 1) * continuity
-    }
-
-    /// 供诊断与门控判断：当前相对首帧的面积增长倍数
-    func scaleRatio(for track: HandTrack) -> CGFloat {
-        guard let first = track.scaleHistory.first, first > 0 else { return 1 }
-        return track.boundingBox.width * track.boundingBox.height / first
     }
 
     // MARK: - 私有
