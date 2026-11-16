@@ -31,10 +31,17 @@ final class RiskEvaluator {
     private var alertFrames = 0
     private var latched = false
 
-    /// alert 最长保持帧数（@30fps 约 5 秒）。正常退出都在 1 秒内完成，
+    /// 最近若干帧的瞬时风险，用于滑动平均。窗口未满时按实际帧数求均值，
+    /// 因此第一帧强信号不会被稀释；只有连续多帧的抖动才会被平滑掉。
+    private var riskWindow: [CGFloat] = []
+    private let riskWindowSize = 3
+    /// 进入遮挡前最后一次可信的平滑风险，仅供无观测帧衰减使用，不参与平滑
+    private var lastObservedRisk: CGFloat = 0
+
+    /// alert 最长保持帧数（@30fps 约 3 秒）。正常退出都在 1 秒内完成，
     /// 这里只作为兜底：任何退出条件因边缘情况失效时，强制恢复，
     /// 避免状态永久卡在 alert 导致后续接近再也无法触发提醒。
-    var maxAlertFrames = 150
+    var maxAlertFrames = 90
 
     /// 输入特征、视觉置信度、遮挡保留系数，输出风险与状态
     func evaluate(
@@ -61,14 +68,28 @@ final class RiskEvaluator {
         // 这样诊断数据里 intentConfidence / risk 可直接对照，不会因两套公式而矛盾。
         let intent = min(max(raw, 0), 1)
 
-        // 缺失观测不直接归零，而是按遮挡保留系数衰减
-        if !hasObservation {
-            raw = max(raw, assessment.risk * occlusionRetention)
-        }
+        // 视觉置信度只做温和压制：快速戳屏时 Vision 置信度会骤降，
+        // 旧系数 0.45+0.55·vc 在 vc=0.2 时把风险压到 56%，实测会把本该触发的
+        // 动作压到阈值以下；改为 0.7+0.3·vc，最差仍保留 70%，减少漏报。
+        raw *= 0.7 + 0.3 * visualConfidence
+        let instantaneous = min(max(raw, 0), 1)
 
-        // 视觉置信度低时风险上限受限，但不完全忽略历史证据
-        raw *= 0.45 + 0.55 * visualConfidence
-        let risk = min(max(raw, 0), 1)
+        // 3 帧滑动平均：食指伸出是二值判定、关键点逐帧抖动，会让瞬时风险
+        // 在阈值上下反复横跳。平滑后单帧尖峰不再触发，稳定接近仍能保持高分。
+        // 窗口未满时按实际帧数求均值，保证第一帧强信号不被稀释。
+        // 仅在有真实观测时更新窗口——遮挡期若把衰减值反复写回，会形成
+        // 「历史高值 → 平滑 → 再保持 → 再平滑」的正反馈，拖慢风险衰减。
+        var risk: CGFloat
+        if hasObservation {
+            riskWindow.append(instantaneous)
+            if riskWindow.count > riskWindowSize { riskWindow.removeFirst() }
+            risk = riskWindow.reduce(0, +) / CGFloat(riskWindow.count)
+            lastObservedRisk = risk
+        } else {
+            // 缺失观测：从最后一次可信风险按遮挡保留系数衰减。
+            // 衰减值既不写回窗口也不更新基线，避免「历史高值反复平滑自己」的锁死。
+            risk = max(instantaneous, lastObservedRisk * occlusionRetention)
+        }
 
         // === 尺度增长门控 ===
         // 连续增长才累积帧数；抬手/张手的一次性跳变会在下一帧被清零。
@@ -160,6 +181,8 @@ final class RiskEvaluator {
         awayFrames = 0
         growthFrames = 0
         alertFrames = 0
+        riskWindow.removeAll()
+        lastObservedRisk = 0
         latched = false
     }
 

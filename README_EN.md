@@ -145,7 +145,7 @@ This is the single most important — and most iterated — rule in the system:
 | Hand held still in the air | Area barely changes | No |
 | Hand moving away from the camera | Negative growth | No |
 
-`HandTrackingEngine.scaleGrowth(for:)` examines the bounding-box area over the last 8 frames: it returns a positive growth score only if the area is more than 6% larger than the first frame, the absolute delta is at least 0.004, and at least 65% of the steps are increases. `RiskEvaluator` then requires growth ≥ 0.22 for 2 consecutive frames before opening the gate. The gate is a **necessary condition** for `alert` — no matter how fast the motion or how gesture-like the pose, without the gate nothing fires. The absolute-delta floor filters out "percentage growth" caused by keypoint jitter.
+`HandTrackingEngine.scaleGrowth(for:)` examines the bounding-box area over the last 8 frames: it returns a positive growth score only if the area is more than 6% larger than the first frame, the absolute delta is at least 0.004, each step grows by > 0.8%, and at least 55% of the steps are increases. `RiskEvaluator` then requires growth ≥ 0.22 for 2 consecutive frames before opening the gate. The gate is a **necessary condition** for `alert` — no matter how fast the motion or how gesture-like the pose, without the gate nothing fires. The absolute-delta floor filters out "percentage growth" caused by keypoint jitter; the continuity floor was relaxed from 65% to 55% to tolerate an occasional area dip during a quick poke, while a one-off jump from raising an open palm still fails the continuity check.
 
 ### Risk scoring
 
@@ -166,6 +166,10 @@ The system **enforces at least one enabled signal** at the data layer: `SignalSe
 
 Thresholds by sensitivity: **Conservative 0.62 / Standard 0.48 / Sensitive 0.36**. The confirmation window was tightened from 3 to 2 frames; strong growth inside the danger zone fires in a single frame so quick pokes are not missed.
 
+**Two anti-jitter measures** (for "unstable triggering"):
+- Visual confidence is applied gently: `0.7 + 0.3 × vc` (previously `0.45 + 0.55 × vc`). Fast motion makes Vision confidence drop sharply; the old factor cut risk by 44% at vc=0.2, pushing a legitimate approach below the threshold. At worst 70% of the risk is now retained.
+- The final risk is a **3-frame moving average** before threshold comparison, removing single-frame spikes and threshold see-saw from the binary index-extended test and keypoint jitter. When the window is not yet full, the average uses the actual frame count so a strong first frame is never diluted. `intentConfidence` remains the unsmoothed, undamped pure feature score, useful for comparing "raw intent" against "decision risk" in diagnostics.
+
 ### State machine
 
 ```
@@ -176,8 +180,8 @@ idle → observing → approaching → alert → recovery → idle
 - `alert` requires 2 consecutive frames passing both gate and threshold (an extremely strong approach signal counts double, reaching it in a single frame ≈ 33ms).
 - Once alerted, the card stays until the hand settles for ~0.67s or all occlusion evidence vanishes — preventing a flash-in-the-pan notification.
 - **Occlusion evidence is refreshed only on frames with a real hand observation.** Frames without observation never update the timestamp, so retention can decay as the hand leaves. If every frame refreshed it, `retainedRisk` would stay at 1 (`elapsed=0`) forever, leaving `alert` permanently stuck after the hand exits — blocking all future reminders.
-- **Alert timeout fallback**: if every exit condition fails due to an edge case, the state is forced back to recovery after `maxAlertFrames` (default 150 ≈ 5s), eliminating a permanent "Alerted" lock.
-- Visual confidence and intent confidence share the same weighted-feature basis: both derive from the enabled signals' weighted score; only `risk` additionally applies occlusion retention and visual-confidence damping, so the two numbers in the diagnostic JSON are directly comparable.
+- **Alert timeout fallback**: if every exit condition fails due to an edge case, the state is forced back to recovery after `maxAlertFrames` (default 90 ≈ 3s), eliminating a permanent "Alerted" lock.
+- Visual confidence and intent confidence share the same weighted-feature basis: both derive from the enabled signals' weighted score. `risk` additionally applies occlusion retention, gentle visual-confidence damping, and a 3-frame moving average, while `intentConfidence` stays raw — the gap between them in the diagnostic JSON shows how much "raw intent" was attenuated before the decision.
 - **Consistent cooldown state**: if the evaluator reaches `alert` while the reminder is still cooling down, the UI shows "Approaching" rather than "Alerted"; only an actually presented notification marks the state as "Alerted", eliminating the "alerted but no popup" mismatch.
 
 ### Concurrency & lifecycle
@@ -294,7 +298,7 @@ swift -e 'import Foundation; DistributedNotificationCenter.default().postNotific
 | Three thresholds | `RiskEvaluator.swift` / `HandProximityDetector.swift` | Sensitivity levels |
 | `maxMissedFrames` | `HandTrackingEngine.swift` | Max frames of occlusion prediction |
 | `predictionWindow` | `OcclusionPredictor.swift` | Occlusion risk prediction window |
-| `maxAlertFrames` | `RiskEvaluator.swift` | Max frames an alert is held (≈5s) as a stuck-state fallback |
+| `maxAlertFrames` | `RiskEvaluator.swift` | Max frames an alert is held (≈3s) as a stuck-state fallback |
 | `dangerZoneTop` | `ScreenGeometry.swift` | Danger-zone start height (read from UserDefaults; no calibration UI in the menu, default 0.42) |
 | Sampling interval | `HandProximityDetector.swift` | Currently ~30fps (33ms) |
 

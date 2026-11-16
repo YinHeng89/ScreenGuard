@@ -95,12 +95,16 @@ final class HandTrackingEngine {
         let relative = (last - baseline) / baseline
         guard relative > 0.06 else { return 0 }
 
+        // 每步增长门槛与连续性比例原本偏严（1.2% / 65%）：快速戳屏时关键点
+        // 抖动会让个别帧面积回落， continuity 掉破门槛导致漏报。温和放宽到
+        // 0.8% / 55%，但保留上面的「绝对增量 + 相对增长」双门槛——抬手/张手
+        // 的一次性跳变 continuity 仍很低，不会误报。
         var growthSteps = 0
         for i in 1..<history.count {
-            if history[i] > history[i - 1] * 1.012 { growthSteps += 1 }
+            if history[i] > history[i - 1] * 1.008 { growthSteps += 1 }
         }
         let continuity = CGFloat(growthSteps) / CGFloat(history.count - 1)
-        guard continuity >= 0.65 else { return 0 }
+        guard continuity >= 0.55 else { return 0 }
 
         return min(max(relative / 0.8, 0), 1) * continuity
     }
