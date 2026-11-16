@@ -208,13 +208,14 @@ ScreenGuard/
 │   ├── OverlayManager.swift               # 悬浮提醒窗口 + 卡片视觉
 │   ├── DiagnosticCapture.swift            # 诊断快照（独立、可删）
 │   ├── Models/
-│   │   └── DetectionModels.swift          # HandTrack / 状态 / 风险评估 / 特征集
+│   │   ├── DetectionModels.swift          # HandTrack / 状态 / 风险评估 / 特征集 + 统一加权口径
+│   │   └── DetectionConfig.swift          # 全部可调参数的唯一来源（阈值/权重/窗口/门控）
 │   └── Detection/
 │       ├── HandPoseAnalyzer.swift         # 手部关键点、食指伸出、手掌张开
 │       ├── HandTrackingEngine.swift       # 多目标关联、轨迹平滑、尺度增长
 │       ├── OcclusionPredictor.swift       # 遮挡期风险维持与衰减
-│       ├── ScreenGeometry.swift           # 危险区归一化模型（可标定）
-│       └── RiskEvaluator.swift            # 特征加权 + 状态机（可调参数集中处）
+│       ├── ScreenGeometry.swift           # 危险区归一化模型
+│       └── RiskEvaluator.swift            # 特征加权 + 显式状态机
 └── build/                                 # 构建产物（已加入 .gitignore）
     └── 屏幕守卫.app
 ```
@@ -288,17 +289,21 @@ swift -e 'import Foundation; DistributedNotificationCenter.default().postNotific
 
 ### 可调参数
 
-| 参数 | 位置 | 作用 |
+所有算法参数集中在 **`Sources/ScreenGuard/Models/DetectionConfig.swift`** 一处，按「采集 / 评分 / 状态机 / 遮挡 / 追踪 / 几何 / 姿态」分组，每项带作用说明。检测模块只引用这里的语义常量，不再出现散落的裸数字——调参只需改这一个文件，不存在同一口径写两份而改漏的情况。
+
+| 分组 | 关键常量 | 作用 |
 | --- | --- | --- |
-| `growthGate` / `growthFramesNeeded` | `RiskEvaluator.swift` | 增长门控松紧：误报多调高，漏报多调低 |
-| 特征权重 `weights` | `RiskEvaluator.swift` | 各信号基准权重；菜单开关会在此基础上重新归一化 |
-| `signal*Enabled` | `MenuContent.swift` / `DetectionModels.swift` | 三路信号开关的持久化键（用户可从菜单直接改） |
-| 阈值三档 | `RiskEvaluator.swift` / `HandProximityDetector.swift` | 灵敏度档位对应阈值 |
-| `maxMissedFrames` | `HandTrackingEngine.swift` | 遮挡预测最长保留帧数 |
-| `predictionWindow` | `OcclusionPredictor.swift` | 遮挡风险预测窗口 |
-| `maxAlertFrames` | `RiskEvaluator.swift` | alert 最长保持帧数（≈3 秒）兜底，防卡死 |
-| `dangerZoneTop` | `ScreenGeometry.swift` | 危险区起点高度（从 UserDefaults 读取，当前菜单无校准入口，默认 0.42） |
-| 采样间隔 | `HandProximityDetector.swift` | 当前约 30fps（33ms） |
+| 采集 | `sensitivityLevels` / `frameIntervalNanos` / `cooldownNanos` | 阈值三档、采样间隔（≈30fps/33ms）、提醒间隔下限 |
+| 评分 | `Weights` / `confidenceFloor`+`confidenceSlope` / `riskWindowSize` | 特征权重（开关会在此基础上归一化）、置信度压制、滑动平均窗口 |
+| 状态机 | `growthGate` / `growthFramesNeeded` / `FastApproach` / `ExitFrames` / `maxAlertFrames` | 增长门控松紧（误报多调高、漏报多调低）、快速通道、各退出帧数、alert 最长保持（≈3 秒兜底防卡死） |
+| 遮挡 | `Occlusion.window` / `holdFloor` / `decayRate` / `exhausted` | 遮挡风险保持窗口与衰减 |
+| 追踪 | `maxMissedFrames` / `Matching` / `Smoothing` / `Growth` | 遮挡预测保留帧数、数据关联、速度平滑、尺度增长双门槛 |
+| 几何 | `dangerZoneTop` / `Zone` / `Direction` | 危险区起点（默认 0.42）与方向评分 |
+| 姿态 | `jointConfidence` / `Gesture` | 关键点置信度、食指/手掌判定 |
+
+`signal*Enabled` 三路信号开关仍由菜单直接控制，持久化键在 `MenuContent.swift` / `DetectionModels.swift`。
+
+> 参数值本身与重构前完全一致，这次只是把它们从五个文件收敛到一处。详见 `DetectionConfig.swift` 内注释。
 
 ---
 

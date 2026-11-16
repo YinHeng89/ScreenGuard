@@ -210,13 +210,14 @@ ScreenGuard/
 │   ├── OverlayManager.swift               # Floating alert window + card visuals
 │   ├── DiagnosticCapture.swift            # Diagnostic snapshots (standalone, removable)
 │   ├── Models/
-│   │   └── DetectionModels.swift          # HandTrack / state / assessment / features
+│   │   ├── DetectionModels.swift          # HandTrack / state / assessment / features + shared scoring
+│   │   └── DetectionConfig.swift          # Single source of truth for all tunable parameters
 │   └── Detection/
 │       ├── HandPoseAnalyzer.swift         # Hand keypoints, index extension, palm openness
 │       ├── HandTrackingEngine.swift       # Multi-target association, smoothing, scale growth
 │       ├── OcclusionPredictor.swift       # Occlusion risk hold / decay
-│       ├── ScreenGeometry.swift           # Normalized danger-zone model (calibratable)
-│       └── RiskEvaluator.swift            # Weighted scoring + state machine (tunables here)
+│       ├── ScreenGeometry.swift           # Normalized danger-zone model
+│       └── RiskEvaluator.swift            # Weighted scoring + explicit state machine
 └── build/                                 # Build output (git-ignored)
     └── 屏幕守卫.app
 ```
@@ -290,17 +291,21 @@ swift -e 'import Foundation; DistributedNotificationCenter.default().postNotific
 
 ### Tunable parameters
 
-| Parameter | File | Effect |
+All algorithm parameters live in one place: **`Sources/ScreenGuard/Models/DetectionConfig.swift`**, grouped by "capture / scoring / state machine / occlusion / tracking / geometry / pose", each with a note on its role. Detection modules only reference these semantic constants; no scattered magic numbers remain. Tuning means editing this single file — there is no longer any risk of changing one copy of a threshold while missing another.
+
+| Group | Key constants | Effect |
 | --- | --- | --- |
-| `growthGate` / `growthFramesNeeded` | `RiskEvaluator.swift` | Gate tightness: raise if false positives, lower if missed detections |
-| `weights` | `RiskEvaluator.swift` | Baseline feature weights; menu toggles re-normalize them |
-| `signal*Enabled` | `MenuContent.swift` / `DetectionModels.swift` | Persisted keys for the three signal toggles (editable from the menu) |
-| Three thresholds | `RiskEvaluator.swift` / `HandProximityDetector.swift` | Sensitivity levels |
-| `maxMissedFrames` | `HandTrackingEngine.swift` | Max frames of occlusion prediction |
-| `predictionWindow` | `OcclusionPredictor.swift` | Occlusion risk prediction window |
-| `maxAlertFrames` | `RiskEvaluator.swift` | Max frames an alert is held (≈3s) as a stuck-state fallback |
-| `dangerZoneTop` | `ScreenGeometry.swift` | Danger-zone start height (read from UserDefaults; no calibration UI in the menu, default 0.42) |
-| Sampling interval | `HandProximityDetector.swift` | Currently ~30fps (33ms) |
+| Capture | `sensitivityLevels` / `frameIntervalNanos` / `cooldownNanos` | Three thresholds, sampling interval (~30fps / 33ms), cooldown floor |
+| Scoring | `Weights` / `confidenceFloor`+`confidenceSlope` / `riskWindowSize` | Feature weights (menu toggles re-normalize them), confidence suppression, moving-average window |
+| State machine | `growthGate` / `growthFramesNeeded` / `FastApproach` / `ExitFrames` / `maxAlertFrames` | Gate tightness (raise if false positives, lower if missed), fast path, exit frame counts, max alert hold (~3s fallback against stuck state) |
+| Occlusion | `Occlusion.window` / `holdFloor` / `decayRate` / `exhausted` | Risk hold window and decay |
+| Tracking | `maxMissedFrames` / `Matching` / `Smoothing` / `Growth` | Occlusion prediction frames, data association, velocity smoothing, scale-growth gates |
+| Geometry | `dangerZoneTop` / `Zone` / `Direction` | Danger-zone start (default 0.42) and direction scoring |
+| Pose | `jointConfidence` / `Gesture` | Keypoint confidence, index/palm detection |
+
+The three `signal*Enabled` toggles are still controlled from the menu; their persisted keys are in `MenuContent.swift` / `DetectionModels.swift`.
+
+> Parameter values are unchanged from before this refactor — the only change is consolidating them from five files into one. See inline comments in `DetectionConfig.swift`.
 
 ---
 

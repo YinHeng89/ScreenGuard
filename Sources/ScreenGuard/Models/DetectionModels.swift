@@ -93,6 +93,29 @@ struct FeatureSet {
     var growth: CGFloat = 0
 
     static let empty = FeatureSet()
+
+    /// 尺度持续增长且方向指向屏幕，才认为手正在靠近。
+    var approaching: Bool {
+        growth >= DetectionConfig.approachingGrowth
+            && direction > DetectionConfig.approachingDirection
+    }
+
+    /// 意图分：按开启的信号加权求和，未开启的通道权重为 0，其余归一化到总和 1。
+    /// 评分器与协调层共用这一个口径，避免两处各写一份权重而漂移。
+    func weightedScore(signals: SignalSettings) -> CGFloat {
+        let w = DetectionConfig.Weights.self
+        let activeGrowth = signals.growth ? w.growth : 0
+        // 方向属于「正在靠近」意图，与 growth 共用一个开关
+        let activeDirection = signals.growth ? w.direction : 0
+        let activeGesture = signals.gesture ? w.gesture : 0
+        let activeZone = signals.zone ? w.zone : 0
+        let total = activeGrowth + activeDirection + activeGesture + activeZone
+
+        return (growth * activeGrowth
+            + direction * activeDirection
+            + gesture * activeGesture
+            + zone * activeZone) / max(total, 0.0001)
+    }
 }
 
 /// 三路可开关的信号。关掉某一路后，它的权重按比例分给其余开启项。

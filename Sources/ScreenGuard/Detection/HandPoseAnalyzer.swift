@@ -5,17 +5,16 @@ import Vision
 enum HandPoseAnalyzer {
     typealias Joint = VNHumanHandPoseObservation.JointName
 
-    static let minimumConfidence: Float = 0.3
-
     /// 从手部观测中提取用于追踪与评分的特征
     static func analyze(_ observation: VNHumanHandPoseObservation) -> (
         observation: HandObservation,
         indexExtended: Bool,
         palmOpen: Bool
     )? {
+        let minimumConfidence = DetectionConfig.jointConfidence
         let points = (try? observation.recognizedPoints(.all)) ?? [:]
         let valid = points.filter { $0.value.confidence > minimumConfidence }
-        guard valid.count >= 6 else { return nil }
+        guard valid.count >= DetectionConfig.minimumValidJoints else { return nil }
 
         func point(_ joint: Joint) -> CGPoint? {
             guard let p = points[joint], p.confidence > minimumConfidence else { return nil }
@@ -49,18 +48,19 @@ enum HandPoseAnalyzer {
             guard let p = point(joint) else { return nil }
             return hypot(p.x - wrist.x, p.y - wrist.y)
         }
+        let g = DetectionConfig.Gesture.self
         let indexExtended: Bool
         if otherLengths.isEmpty {
-            indexExtended = indexLength > 0.12
+            indexExtended = indexLength > g.indexLength
         } else {
             let average = otherLengths.reduce(0, +) / CGFloat(otherLengths.count)
-            indexExtended = indexLength > average * 1.12 && indexLength > 0.12
+            indexExtended = indexLength > average * g.indexRatio && indexLength > g.indexLength
         }
 
         // 手掌张开：MCP 三点间距较大
         let spread1 = hypot(middleMCP.x - ringMCP.x, middleMCP.y - ringMCP.y)
         let spread2 = hypot(ringMCP.x - littleMCP.x, ringMCP.y - littleMCP.y)
-        let palmOpen = (spread1 + spread2) > 0.16
+        let palmOpen = (spread1 + spread2) > g.palmSpread
 
         let handObservation = HandObservation(
             boundingBox: box,

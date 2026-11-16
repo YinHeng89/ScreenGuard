@@ -1,165 +1,66 @@
 import CoreGraphics
 import Foundation
 
-/// 综合特征输出风险评分，并维护风险状态机。
+/// 第五层：把特征综合成风险评分，并驱动六态状态机。
 ///
-/// 核心原则：只有观察到手部尺度「持续变大」（由远及近）才允许报警。
-/// 抬手、张手、静态悬停都不是接近动作，一律被尺度增长门控拦下。
-///
-/// 精简原则：评分只保留真正有判别力的信号。速度来自两帧关键点差分，抖动大，
-/// 仅写入诊断数据而不参与评分；上肢特征在常见坐姿下恒为 0，整条分支已移除。
+/// 设计原则：只有观察到手部尺度「持续变大」才允许报警。抬手、张手、静态悬停
+/// 都不构成接近动作，由尺度增长门控统一拦下。速度因逐帧抖动大，只写入诊断
+/// 数据、不参与评分。
 final class RiskEvaluator {
     private(set) var state: DetectionState = .idle
     private(set) var assessment = RiskAssessment.empty
 
-    /// 评分权重，总和为 1。growth 占主导，zone 提供位置约束，其余仅弱辅助。
-    private let weights = (
-        growth: CGFloat(0.62),
-        direction: CGFloat(0.08),
-        gesture: CGFloat(0.12),
-        zone: CGFloat(0.18)
-    )
-
-    /// 尺度增长门控：增长强度至少达到此值才认为手在靠近
-    var growthGate: CGFloat = 0.22
-    /// 连续增长帧数门槛（@30fps：2 帧约 66ms）
-    var growthFramesNeeded = 2
-
+    // 状态机计数器：near 累积进入证据，away 累积退出证据，growth 累积连续增长，
+    // alert 记录已锁定时长。全部只在 analyze 所在的 analysisQueue 上访问。
     private var nearFrames = 0
     private var awayFrames = 0
     private var growthFrames = 0
     private var alertFrames = 0
     private var latched = false
 
-    /// 最近若干帧的瞬时风险，用于滑动平均。窗口未满时按实际帧数求均值，
-    /// 因此第一帧强信号不会被稀释；只有连续多帧的抖动才会被平滑掉。
+    /// 最近若干帧的瞬时风险，滑动平均抑制抖动。窗口未满时按实际帧数求均值，
+    /// 因此首帧强信号不会被稀释。
     private var riskWindow: [CGFloat] = []
-    private let riskWindowSize = 3
-    /// 进入遮挡前最后一次可信的平滑风险，仅供无观测帧衰减使用，不参与平滑
+    /// 进入遮挡前最后一次可信的平滑风险，仅供无观测帧衰减，不写回窗口，
+    /// 避免衰减值与窗口互相强化导致风险无法消退。
     private var lastObservedRisk: CGFloat = 0
 
-    /// alert 最长保持帧数（@30fps 约 3 秒）。正常退出都在 1 秒内完成，
-    /// 这里只作为兜底：任何退出条件因边缘情况失效时，强制恢复，
-    /// 避免状态永久卡在 alert 导致后续接近再也无法触发提醒。
-    var maxAlertFrames = 90
-
-    /// 输入特征、视觉置信度、遮挡保留系数，输出风险与状态
+    /// 输入特征、视觉置信度、遮挡保留系数，输出风险与状态。
     func evaluate(
         features: FeatureSet,
         visualConfidence: CGFloat,
         occlusionRetention: CGFloat,
         hasObservation: Bool
     ) -> RiskAssessment {
-        // 三路信号开关：关掉的通道权重为 0，其余通道按原比例归一化到总和 1。
         let signals = SignalSettings.current
-        let activeGrowth = signals.growth ? weights.growth : 0
-        let activeDirection = signals.growth ? weights.direction : 0
-        let activeGesture = signals.gesture ? weights.gesture : 0
-        let activeZone = signals.zone ? weights.zone : 0
-        let activeTotal = activeGrowth + activeDirection + activeGesture + activeZone
+        let risk = smoothedRisk(
+            features: features,
+            signals: signals,
+            visualConfidence: visualConfidence,
+            occlusionRetention: occlusionRetention,
+            hasObservation: hasObservation
+        )
+        let intent = intentScore(features: features, signals: signals)
 
-        var raw = features.growth * activeGrowth
-        raw += features.direction * activeDirection
-        raw += features.gesture * activeGesture
-        raw += features.zone * activeZone
-        raw /= max(activeTotal, 0.0001)
-
-        // 意图分与风险分共用同一套加权口径；区别仅在 risk 会叠加遮挡保留与视觉置信度。
-        // 这样诊断数据里 intentConfidence / risk 可直接对照，不会因两套公式而矛盾。
-        let intent = min(max(raw, 0), 1)
-
-        // 视觉置信度只做温和压制：快速戳屏时 Vision 置信度会骤降，
-        // 旧系数 0.45+0.55·vc 在 vc=0.2 时把风险压到 56%，实测会把本该触发的
-        // 动作压到阈值以下；改为 0.7+0.3·vc，最差仍保留 70%，减少漏报。
-        raw *= 0.7 + 0.3 * visualConfidence
-        let instantaneous = min(max(raw, 0), 1)
-
-        // 3 帧滑动平均：食指伸出是二值判定、关键点逐帧抖动，会让瞬时风险
-        // 在阈值上下反复横跳。平滑后单帧尖峰不再触发，稳定接近仍能保持高分。
-        // 窗口未满时按实际帧数求均值，保证第一帧强信号不被稀释。
-        // 仅在有真实观测时更新窗口——遮挡期若把衰减值反复写回，会形成
-        // 「历史高值 → 平滑 → 再保持 → 再平滑」的正反馈，拖慢风险衰减。
-        var risk: CGFloat
-        if hasObservation {
-            riskWindow.append(instantaneous)
-            if riskWindow.count > riskWindowSize { riskWindow.removeFirst() }
-            risk = riskWindow.reduce(0, +) / CGFloat(riskWindow.count)
-            lastObservedRisk = risk
-        } else {
-            // 缺失观测：从最后一次可信风险按遮挡保留系数衰减。
-            // 衰减值既不写回窗口也不更新基线，避免「历史高值反复平滑自己」的锁死。
-            risk = max(instantaneous, lastObservedRisk * occlusionRetention)
-        }
-
-        // === 尺度增长门控 ===
-        // 连续增长才累积帧数；抬手/张手的一次性跳变会在下一帧被清零。
-        if features.growth >= growthGate {
-            growthFrames += 1
-        } else {
-            growthFrames = 0
-        }
-        // 「正在靠近」关掉时，门控随之停用；由用户显式选择只靠区域/姿态判断。
+        // 尺度增长门控：只有连续多帧达标才算「正在靠近」。
+        growthFrames = features.growth >= DetectionConfig.growthGate ? growthFrames + 1 : 0
+        // 用户关闭「正在靠近」时门控停用，改由区域/姿态独立判断。
         let gateOpen = signals.growth
-            ? (features.growth >= growthGate && growthFrames >= growthFramesNeeded)
+            ? (features.growth >= DetectionConfig.growthGate
+                && growthFrames >= DetectionConfig.growthFramesNeeded)
             : true
 
-        let threshold = currentThreshold()
-        let newState: DetectionState
-
-        // 快速通道同样以增长为核心，并额外要求进入危险区；不再依赖抖动大的速度/方向
-        let strongApproach = signals.growth && hasObservation
-            && features.growth >= 0.55
-            && features.zone >= 0.4
-            && visualConfidence >= 0.55
-
-        if !latched {
-            if gateOpen && risk >= threshold && hasObservation {
-                nearFrames += strongApproach ? 2 : 1
-                awayFrames = 0
-                if nearFrames >= 2 {
-                    latched = true
-                    alertFrames = 0
-                    newState = .alert
-                } else {
-                    newState = .approaching
-                }
-            } else if gateOpen && risk >= threshold * 0.6 {
-                // 门控开着但风险略低：衰减一票，保留观察，不直接清零
-                nearFrames = max(0, nearFrames - 1)
-                newState = .observing
-            } else {
-                // 没有持续变大证据：一律清零。抬手/张手/静态悬停都走这里。
-                nearFrames = 0
-                newState = hasObservation ? .idle : .occluded
-            }
-        } else {
-            // 已报警：维持提醒，直到手明确停住 / 远离 / 失去遮挡证据
-            alertFrames += 1
-            let handSettled = signals.growth && hasObservation && features.growth < 0.1
-            let noEvidence = !hasObservation && occlusionRetention <= 0.25
-            let riskGone = hasObservation && risk <= threshold * 0.35
-            // 兜底：即使所有退出条件都因边缘情况失效，超过最长保持时间也强制恢复，
-            // 避免状态永久卡在「已提醒」而阻断后续提醒。
-            let timedOut = alertFrames >= maxAlertFrames
-            if handSettled || noEvidence || riskGone || timedOut {
-                awayFrames += 1
-                // 手停住给较长时间（约 0.67s）避免提醒一闪而过；超时则一帧即恢复
-                let needed = timedOut ? 1 : (handSettled ? 20 : (noEvidence ? 6 : 10))
-                if awayFrames >= needed {
-                    latched = false
-                    nearFrames = 0
-                    awayFrames = 0
-                    growthFrames = 0
-                    alertFrames = 0
-                    newState = .recovery
-                } else {
-                    newState = .alert
-                }
-            } else {
-                awayFrames = 0
-                newState = .alert
-            }
-        }
+        let threshold = DetectionConfig.threshold
+        let newState = nextState(
+            features: features,
+            signals: signals,
+            risk: risk,
+            threshold: threshold,
+            gateOpen: gateOpen,
+            visualConfidence: visualConfidence,
+            occlusionRetention: occlusionRetention,
+            hasObservation: hasObservation
+        )
 
         state = newState
         assessment = RiskAssessment(
@@ -186,9 +87,135 @@ final class RiskEvaluator {
         latched = false
     }
 
-    private func currentThreshold() -> CGFloat {
-        let levels: [CGFloat] = [0.62, 0.48, 0.36]
-        let raw = UserDefaults.standard.integer(forKey: "sensitivity")
-        return levels[min(max(raw, 0), levels.count - 1)]
+    // MARK: - 评分
+
+    /// 意图分与风险分共用 FeatureSet 的同一加权口径，仅风险额外叠加置信度与遮挡衰减。
+    /// 这样诊断数据里 intentConfidence 与 risk 可直接对照，不会因两套公式而矛盾。
+    private func intentScore(features: FeatureSet, signals: SignalSettings) -> CGFloat {
+        min(max(features.weightedScore(signals: signals), 0), 1)
+    }
+
+    private func smoothedRisk(
+        features: FeatureSet,
+        signals: SignalSettings,
+        visualConfidence: CGFloat,
+        occlusionRetention: CGFloat,
+        hasObservation: Bool
+    ) -> CGFloat {
+        var raw = features.weightedScore(signals: signals)
+        raw *= DetectionConfig.confidenceFloor + DetectionConfig.confidenceSlope * visualConfidence
+        let instantaneous = min(max(raw, 0), 1)
+
+        if hasObservation {
+            riskWindow.append(instantaneous)
+            if riskWindow.count > DetectionConfig.riskWindowSize { riskWindow.removeFirst() }
+            let average = riskWindow.reduce(0, +) / CGFloat(riskWindow.count)
+            lastObservedRisk = average
+            return average
+        }
+
+        // 缺失观测：从最后一次可信风险按遮挡保留系数衰减，
+        // 衰减值既不写回窗口也不更新基线，避免自引用锁死。
+        return max(instantaneous, lastObservedRisk * occlusionRetention)
+    }
+
+    // MARK: - 状态机
+
+    private func nextState(
+        features: FeatureSet,
+        signals: SignalSettings,
+        risk: CGFloat,
+        threshold: CGFloat,
+        gateOpen: Bool,
+        visualConfidence: CGFloat,
+        occlusionRetention: CGFloat,
+        hasObservation: Bool
+    ) -> DetectionState {
+        latched ? alertState(
+            features: features, signals: signals, risk: risk, threshold: threshold,
+            occlusionRetention: occlusionRetention, hasObservation: hasObservation
+        ) : idleState(
+            features: features, signals: signals, risk: risk, threshold: threshold,
+            gateOpen: gateOpen, visualConfidence: visualConfidence,
+            hasObservation: hasObservation
+        )
+    }
+
+    /// 未锁定：累积接近证据，满足条件后进入 alert。
+    private func idleState(
+        features: FeatureSet,
+        signals: SignalSettings,
+        risk: CGFloat,
+        threshold: CGFloat,
+        gateOpen: Bool,
+        visualConfidence: CGFloat,
+        hasObservation: Bool
+    ) -> DetectionState {
+        let fast = DetectionConfig.FastApproach.self
+        let strongApproach = signals.growth && hasObservation
+            && features.growth >= fast.growth
+            && features.zone >= fast.zone
+            && visualConfidence >= fast.confidence
+
+        if gateOpen && risk >= threshold && hasObservation {
+            nearFrames += strongApproach ? fast.credit : 1
+            awayFrames = 0
+            if nearFrames >= DetectionConfig.enterFrames {
+                latched = true
+                alertFrames = 0
+                return .alert
+            }
+            return .approaching
+        }
+
+        if gateOpen && risk >= threshold * DetectionConfig.observeFactor {
+            // 略低于阈值：衰减一票，保留观察，不直接清零。
+            nearFrames = max(0, nearFrames - 1)
+            return .observing
+        }
+
+        // 没有持续变大的证据：抬手、张手、静态悬停都走这里。
+        nearFrames = 0
+        return hasObservation ? .idle : .occluded
+    }
+
+    /// 已锁定：维持提醒，直到手停住 / 远离 / 遮挡证据耗尽 / 超时。
+    private func alertState(
+        features: FeatureSet,
+        signals: SignalSettings,
+        risk: CGFloat,
+        threshold: CGFloat,
+        occlusionRetention: CGFloat,
+        hasObservation: Bool
+    ) -> DetectionState {
+        alertFrames += 1
+
+        let handSettled = signals.growth && hasObservation
+            && features.growth < DetectionConfig.settledGrowth
+        let noEvidence = !hasObservation
+            && occlusionRetention <= DetectionConfig.Occlusion.exhausted
+        let riskGone = hasObservation
+            && risk <= threshold * DetectionConfig.riskGoneFactor
+        let timedOut = alertFrames >= DetectionConfig.maxAlertFrames
+
+        guard handSettled || noEvidence || riskGone || timedOut else {
+            awayFrames = 0
+            return .alert
+        }
+
+        awayFrames += 1
+        let frames = DetectionConfig.ExitFrames.self
+        let needed = timedOut ? 1
+            : handSettled ? frames.settled
+            : noEvidence ? frames.noEvidence
+            : frames.riskGone
+        guard awayFrames >= needed else { return .alert }
+
+        latched = false
+        nearFrames = 0
+        awayFrames = 0
+        growthFrames = 0
+        alertFrames = 0
+        return .recovery
     }
 }
