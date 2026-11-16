@@ -100,11 +100,13 @@ final class DiagnosticCapture: @unchecked Sendable {
         NSWorkspace.shared.open(root)
     }
 
-    /// 已保存的快照数量（按 PNG 计）
+    /// 已保存的快照数量（按 PNG 计）。读也走私有队列，避免与 save/clearAll 的写并发。
     var count: Int {
         guard let root = rootURL else { return 0 }
-        return (try? fileManager.contentsOfDirectory(atPath: root.path))?
-            .filter { $0.hasSuffix(".png") }.count ?? 0
+        return queue.sync {
+            (try? fileManager.contentsOfDirectory(atPath: root.path))?
+                .filter { $0.hasSuffix(".png") }.count ?? 0
+        }
     }
 
     /// 清空全部诊断文件

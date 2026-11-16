@@ -30,8 +30,14 @@ final class HandProximityDetector: NSObject, ObservableObject {
 
     // MARK: - 状态
 
-    private var desiredRunning = false
-    private var generation: UInt64 = 0
+    /// 生命周期状态跨线程读写（主线程写、sessionQueue/回调读），用锁保证原子性。
+    private let lifecycleLock = NSLock()
+    private var _generation: UInt64 = 0
+    private var _desiredRunning = false
+
+    /// 只在 analysisQueue 内读写。start 成功后置 true，stop/reset 时置 false，
+    /// 用于丢弃已入队的残留帧；检测模块的复位也在该队列内串行完成，消除数据竞争。
+    private var analysisActive = false
     private var lastProcessedUp: UInt64 = 0
     private var lastTriggerUp: UInt64 = 0
     private var consecutiveErrors = 0
@@ -70,10 +76,11 @@ final class HandProximityDetector: NSObject, ObservableObject {
     }
 
     func start(deviceID: String) {
-        generation += 1
-        let token = generation
-        desiredRunning = true
-        statusText = "正在启动"
+        let token = beginTransition(desiredRunning: true)
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.isCurrent(token) else { return }
+            self.statusText = "正在启动"
+        }
 
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized:
@@ -82,32 +89,49 @@ final class HandProximityDetector: NSObject, ObservableObject {
             AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
                 guard let self else { return }
                 DispatchQueue.main.async {
-                    guard self.isCurrent(token), granted else {
-                        if !granted { self.statusText = "相机权限未开启" }
+                    guard self.isCurrent(token) else { return }
+                    if !granted {
+                        self.statusText = "相机权限未开启"
                         return
                     }
                     self.configureSession(deviceID: deviceID, token: token)
                 }
             }
         default:
-            statusText = "相机权限被拒绝"
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.isCurrent(token) else { return }
+                self.statusText = "相机权限被拒绝"
+            }
         }
     }
 
     func stop() {
-        generation += 1
-        desiredRunning = false
+        _ = beginTransition(desiredRunning: false)
         sessionQueue.async { [weak self] in
             guard let self, self.session.isRunning else { return }
             self.session.stopRunning()
         }
         resetState()
-        statusText = "已暂停"
-        onClear?()
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.statusText = "已暂停"
+            self.onClear?()
+        }
+    }
+
+    /// 原子地递增 generation 并设定运行意图，返回新 token
+    private func beginTransition(desiredRunning: Bool) -> UInt64 {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        _generation += 1
+        _desiredRunning = desiredRunning
+        return _generation
     }
 
     private func isCurrent(_ token: UInt64) -> Bool {
-        token == generation && desiredRunning
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        return token == _generation && _desiredRunning
     }
 
     private func configureSession(deviceID: String, token: UInt64) {
@@ -151,6 +175,8 @@ final class HandProximityDetector: NSObject, ObservableObject {
                     }
                     return
                 }
+                // 先激活分析队列再放行 UI：与帧处理同一队列，保证时序
+                self.analysisQueue.async { self.analysisActive = true }
                 self.isMonitoring = true
                 self.statusText = "监测中"
             }
@@ -173,23 +199,29 @@ final class HandProximityDetector: NSObject, ObservableObject {
     }
 
     private func resetState() {
-        tracker.clear()
-        occlusion.reset()
-        evaluator.reset()
-        isMonitoring = false
-        isClose = false
-        detectionStrength = 0
-        indexExtended = false
-        approaching = false
-        zoneStrength = 0
-        stateText = "待机"
-        consecutiveErrors = 0
-        // 诊断缓存与判定镜像都在 analysisQueue 内访问，清理也送回该队列
+        // 检测模块与诊断缓存全部只在 analysisQueue 内访问，复位必须串行到该队列，
+        // 否则会与正在执行的 processFrame 发生数据竞争。
         analysisQueue.async { [weak self] in
             guard let self else { return }
+            self.analysisActive = false
+            self.tracker.clear()
+            self.occlusion.reset()
+            self.evaluator.reset()
             self.localIsClose = false
             self.lastPixelBuffer = nil
             self.lastFrameMeta = [:]
+            self.consecutiveErrors = 0
+        }
+        // @Published 状态统一回主线程写
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.isMonitoring = false
+            self.isClose = false
+            self.detectionStrength = 0
+            self.indexExtended = false
+            self.approaching = false
+            self.zoneStrength = 0
+            self.stateText = "待机"
         }
     }
 
@@ -276,13 +308,26 @@ final class HandProximityDetector: NSObject, ObservableObject {
         )
 
         let strength = min(max(assessment.risk / currentThreshold(), 0), 1)
+        // wasClose / localIsClose 表示「本轮接近是否已真正上报提醒」，
+        // 而非 evaluator 的内部 alert 状态——后者在冷却期会先进 alert 却不上报，
+        // 若直接拿来驱动 UI 会出现「状态已提醒但没弹窗」的误导。
         let wasClose = localIsClose
         let now = Self.uptimeNanos()
-        let fired = assessment.state == .alert && !wasClose
-            && (lastTriggerUp == 0 || now - lastTriggerUp >= cooldownNanos())
+        let inAlert = assessment.state == .alert
+        let cooldownOK = lastTriggerUp == 0 || now - lastTriggerUp >= cooldownNanos()
+        let fired = inAlert && !wasClose && cooldownOK
 
-        if fired { lastTriggerUp = now }
-        localIsClose = assessment.state == .alert
+        if fired {
+            lastTriggerUp = now
+            localIsClose = true
+        } else if !inAlert {
+            // 已退出 alert（恢复/待机），允许下一轮接近再次上报
+            localIsClose = false
+        }
+        // 注：inAlert && 冷却未到 && 本轮未上报 → 既不上报也不清标记，UI 显示「接近中」
+        // 在 analysisQueue 内算出 UI 快照值，避免 main 块跨线程读取可变属性
+        let announced = inAlert && localIsClose
+        let displayState = inAlert && !announced ? "接近中" : assessment.state.rawValue
 
         // 诊断快照：在 analysisQueue 内、pixelBuffer 仍有效时转换并落盘
         if fired {
@@ -311,12 +356,13 @@ final class HandProximityDetector: NSObject, ObservableObject {
             self.indexExtended = indexExtended
             self.approaching = approaching
             self.zoneStrength = features.zone
-            self.stateText = assessment.state.rawValue
-            self.isClose = assessment.state == .alert
+            // 只有真正上报过提醒才算「已提醒」；冷却期压住的 alert 显示「接近中」
+            self.isClose = announced
+            self.stateText = displayState
 
             if fired {
                 self.onTrigger?(assessment.risk)
-            } else if assessment.state == .recovery && wasClose {
+            } else if !inAlert && wasClose {
                 self.onClear?()
             }
         }
@@ -408,6 +454,10 @@ extension HandProximityDetector: AVCaptureVideoDataOutputSampleBufferDelegate {
         didOutput sampleBuffer: CMSampleBuffer,
         from connection: AVCaptureConnection
     ) {
+        // 丢弃 stop/切相机后已入队的残留帧：这些帧会用被清空的状态误判。
+        // analysisActive 与本回调同在 analysisQueue，无数据竞争。
+        guard analysisActive else { return }
+
         let now = Self.uptimeNanos()
         // 采样提到 ~30fps：3 帧确认窗口从 200ms 缩到 100ms，覆盖快速戳屏动作
         if lastProcessedUp != 0 && now - lastProcessedUp < 33_000_000 { return }

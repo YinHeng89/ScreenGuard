@@ -3,7 +3,8 @@ import Foundation
 
 /// 屏幕危险区域的归一化坐标模型。
 /// 注意：这是基于视觉经验的近似区域，不是精确的三维相机外参标定。
-/// 用户可通过校准调整危险区的高度起点，以适配不同坐姿与摄像头视角。
+/// 起点高度可从 UserDefaults 的 dangerZoneTop 读取，便于按坐姿/视角调整，
+/// 但当前菜单未提供校准入口，使用默认值 0.42。
 struct ScreenGeometry {
     /// 危险区起点（Vision 坐标 y，原点左下）。y 小于此值视为进入接近区
     var dangerZoneTop: CGFloat
@@ -42,9 +43,5 @@ struct ScreenGeometry {
         if let saved = UserDefaults.standard.object(forKey: "dangerZoneTop") as? Double {
             dangerZoneTop = CGFloat(saved)
         }
-    }
-
-    func save() {
-        UserDefaults.standard.set(Double(dangerZoneTop), forKey: "dangerZoneTop")
     }
 }

@@ -75,7 +75,7 @@ struct MenuContent: View {
                         }
                 }
 
-                Text("关闭某路信号后，其权重分给其余项；关掉「正在靠近」将不再要求手持续变大。")
+                Text("关闭某路信号后，其权重分给其余项。「正在靠近」同时包含尺度增长与运动方向，关掉后不再要求手持续变大，误报会上升。")
                     .font(.system(size: 9.5))
                     .foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -195,6 +195,11 @@ struct MenuContent: View {
         .background(Color(nsColor: .windowBackgroundColor))
         .background(MenuPanelBackgroundFixer())
         .onAppear {
+            // 数据层兜底校正：若三路信号曾被写到全关，这里回写保证 UI 与评分一致
+            SignalSettings.sanitizePersisted()
+            growthEnabled = SignalSettings.current.growth
+            gestureEnabled = SignalSettings.current.gesture
+            zoneEnabled = SignalSettings.current.zone
             cameras = discoverCameras()
             snapshotCount = DiagnosticCapture.shared.count
         }

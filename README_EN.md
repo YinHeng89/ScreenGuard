@@ -160,7 +160,9 @@ Only discriminative signals are scored (weights sum to 1):
 
 `velocity` is still computed and written to the diagnostic JSON but **does not affect scoring**: at 30fps, a two-frame keypoint difference amplifies jitter into high speed, which was the main noise source behind false positives. The upper-body extension branch and its weight redistribution have been removed entirely, since the feature is constantly 0 in normal seated use.
 
-**Three signal toggles**: the `Index extended` / `Approaching` / `Danger zone` tags in the menu are clickable switches mapped to `gesture` / `growth + direction` / `zone`. Turning one off zeroes its weight and re-normalizes the remaining enabled weights to sum to 1 — e.g. with `Danger zone` off, the weights become growth ≈0.76 / direction ≈0.10 / gesture ≈0.15. At least one signal must stay on. Note: turning off `Approaching` also disables the hard scale-growth gate, so alerts then rely only on zone and gesture and **false positives will rise noticeably**.
+**Three signal toggles**: the `Index extended` / `Approaching` / `Danger zone` tags in the menu are clickable switches mapped to `gesture` / `growth + direction` / `zone`. Turning one off zeroes its weight and re-normalizes the remaining enabled weights to sum to 1 — e.g. with `Danger zone` off, the weights become growth ≈0.76 / direction ≈0.10 / gesture ≈0.15.
+
+The system **enforces at least one enabled signal** at the data layer: `SignalSettings.current` falls back to enabling `Approaching` even if all three were persisted as off, avoiding a zero scoring denominator that would silence monitoring permanently; opening the menu also writes this fallback back to correct the UI. Note: `direction` has no independent toggle and belongs to `Approaching` — turning it off also disables the direction feature and the hard scale-growth gate, so alerts then rely only on zone and gesture and **false positives will rise noticeably**.
 
 Thresholds by sensitivity: **Conservative 0.62 / Standard 0.48 / Sensitive 0.36**. The confirmation window was tightened from 3 to 2 frames; strong growth inside the danger zone fires in a single frame so quick pokes are not missed.
 
@@ -171,9 +173,15 @@ idle → observing → approaching → alert → recovery → idle
                  ↘ occluded (optional, not a required stage)
 ```
 
-- `alert` requires 3 consecutive frames passing both gate and threshold (an extremely strong approach signal counts double, reaching it in two frames ≈ 66ms).
+- `alert` requires 2 consecutive frames passing both gate and threshold (an extremely strong approach signal counts double, reaching it in a single frame ≈ 33ms).
 - Once alerted, the card stays until the hand settles for ~0.67s or all occlusion evidence vanishes — preventing a flash-in-the-pan notification.
-- Visual confidence and intent confidence are deliberately separate: "seeing clearly" ≠ "intending to touch."
+- Visual confidence and intent confidence share the same weighted-feature basis: both derive from the enabled signals' weighted score; only `risk` additionally applies occlusion retention and visual-confidence damping, so the two numbers in the diagnostic JSON are directly comparable.
+- **Consistent cooldown state**: if the evaluator reaches `alert` while the reminder is still cooling down, the UI shows "Approaching" rather than "Alerted"; only an actually presented notification marks the state as "Alerted", eliminating the "alerted but no popup" mismatch.
+
+### Concurrency & lifecycle
+
+- The capture session and lifecycle state are guarded by a `generation` token plus a lock, preventing stale sessions from reviving via delayed camera-permission callbacks; all UI-state writes in `start` / `stop` are dispatched to the main thread.
+- Frame processing, detector reset, and diagnostic caching are all serialized on `analysisQueue`; `stop` / camera switching sets `analysisActive=false` to discard already-enqueued stale frames, eliminating cross-thread data races and "ghost alerts."
 
 ---
 
@@ -284,7 +292,7 @@ swift -e 'import Foundation; DistributedNotificationCenter.default().postNotific
 | Three thresholds | `RiskEvaluator.swift` / `HandProximityDetector.swift` | Sensitivity levels |
 | `maxMissedFrames` | `HandTrackingEngine.swift` | Max frames of occlusion prediction |
 | `predictionWindow` | `OcclusionPredictor.swift` | Occlusion risk prediction window |
-| `dangerZoneTop` | `ScreenGeometry.swift` | Danger-zone position (persisted, calibratable) |
+| `dangerZoneTop` | `ScreenGeometry.swift` | Danger-zone start height (read from UserDefaults; no calibration UI in the menu, default 0.42) |
 | Sampling interval | `HandProximityDetector.swift` | Currently ~30fps (33ms) |
 
 ---

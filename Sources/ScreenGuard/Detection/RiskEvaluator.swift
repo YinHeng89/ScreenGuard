@@ -51,6 +51,10 @@ final class RiskEvaluator {
         raw += features.zone * activeZone
         raw /= max(activeTotal, 0.0001)
 
+        // 意图分与风险分共用同一套加权口径；区别仅在 risk 会叠加遮挡保留与视觉置信度。
+        // 这样诊断数据里 intentConfidence / risk 可直接对照，不会因两套公式而矛盾。
+        let intent = min(max(raw, 0), 1)
+
         // 缺失观测不直接归零，而是按遮挡保留系数衰减
         if !hasObservation {
             raw = max(raw, assessment.risk * occlusionRetention)
@@ -59,11 +63,6 @@ final class RiskEvaluator {
         // 视觉置信度低时风险上限受限，但不完全忽略历史证据
         raw *= 0.45 + 0.55 * visualConfidence
         let risk = min(max(raw, 0), 1)
-
-        let intent = min(max(
-            features.growth * 0.55 + features.zone * 0.25 + features.gesture * 0.2,
-            0
-        ), 1)
 
         // === 尺度增长门控 ===
         // 连续增长才累积帧数；抬手/张手的一次性跳变会在下一帧被清零。

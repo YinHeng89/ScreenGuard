@@ -41,9 +41,6 @@ struct HandTrack {
         self.confidence = confidence
         self.lastObservedAt = lastObservedAt
     }
-
-    /// 用于与目标关联的代表点：优先手掌，其次手腕
-    var anchor: CGPoint { palm }
 }
 
 /// 风险状态机的六个状态
@@ -110,11 +107,33 @@ struct SignalSettings {
 
     static var current: SignalSettings {
         let defaults = UserDefaults.standard
-        return SignalSettings(
+        let settings = SignalSettings(
             growth: defaults.object(forKey: "signalGrowthEnabled") as? Bool ?? true,
             gesture: defaults.object(forKey: "signalGestureEnabled") as? Bool ?? true,
             zone: defaults.object(forKey: "signalZoneEnabled") as? Bool ?? true
         )
+        // 兜底：三路全关会让评分分母 activeTotal=0、风险恒为 0，监测永久静默。
+        // 数据层保证至少一路开启，不依赖 UI 层的 onChange 守卫。
+        return settings.sanitized
+    }
+
+    /// 至少保留一路信号；全关时自动恢复最核心的「正在靠近」。
+    var sanitized: SignalSettings {
+        if !growth && !gesture && !zone {
+            var fixed = self
+            fixed.growth = true
+            return fixed
+        }
+        return self
+    }
+
+    /// 把兜底结果写回持久化，供菜单启动时校正 UI 开关状态。
+    static func sanitizePersisted() {
+        let fixed = current.sanitized
+        let defaults = UserDefaults.standard
+        defaults.set(fixed.growth, forKey: "signalGrowthEnabled")
+        defaults.set(fixed.gesture, forKey: "signalGestureEnabled")
+        defaults.set(fixed.zone, forKey: "signalZoneEnabled")
     }
 }
 
