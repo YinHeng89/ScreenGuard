@@ -254,6 +254,10 @@ A temporary feature built for tuning. On each alert it saves the camera frame pl
 - **Auto snapshot**: saved on alert, for analyzing false positives
 - **Record current**: manual button, for analyzing missed detections (hand touched but no alert)
 - JSON includes: algorithm version, risk, threshold, growth/zone/gesture/direction features, velocity (diagnostic only), dual confidences, occlusion retention, gate state, scale history, track details
+- Three added observation fields for telling " wiping hands" false positives from real screen pokes (**logged only, never scored**):
+  - `handCount` / `handsDetail`: how many hands were detected and each hand's own pose/scale — useful to check whether hand-rubbing involved two hands, or whether one hand's pose was wrongly attributed to the tracked target.
+  - `velocityHistory`: normalized speed over the last ~12 frames (≈0.4s). Wiping tends to stay fast; a real poke decelerates on contact.
+  - `palmHistory`: palm coordinates over the same window, paired 1:1 with `velocityHistory`, so the trajectory's "dwell" at contact can be inspected.
 
 **To remove entirely**: delete `DiagnosticCapture.swift` and the handful of call sites in `HandProximityDetector`, `MenuContent.swift`, and `main.swift`. Nothing else is affected. With the menu toggle off, nothing is written to disk.
 

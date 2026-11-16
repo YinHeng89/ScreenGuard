@@ -51,6 +51,9 @@ final class HandProximityDetector: NSObject, ObservableObject {
     // 诊断快照：最近一帧的像素缓冲与元数据，仅在 analysisQueue 读写
     private var lastPixelBuffer: CVPixelBuffer?
     private var lastFrameMeta: [String: Any] = [:]
+    /// 最近帧的速度与主目标手掌轨迹，仅写入诊断 JSON，不参与任何判定。
+    private var velocityHistory: [CGFloat] = []
+    private var palmHistory: [CGPoint] = []
 
     // MARK: - 对外状态
 
@@ -207,6 +210,8 @@ final class HandProximityDetector: NSObject, ObservableObject {
             self.reportIssued = false
             self.lastPixelBuffer = nil
             self.lastFrameMeta = [:]
+            self.velocityHistory = []
+            self.palmHistory = []
             self.consecutiveErrors = 0
         }
         // @Published 状态统一回主线程写
@@ -240,6 +245,17 @@ final class HandProximityDetector: NSObject, ObservableObject {
 
         // 第三层：运动意图特征
         let features = extractFeatures(primary: primary, observation: observation, time: time)
+
+        // 诊断时间序列：只在有主目标时成对记录，供事后区分「持续高速」与「接近后停驻」。
+        // 纯观测数据，不参与任何评分或状态判定。
+        if let track = primary {
+            velocityHistory.append(features.velocity)
+            palmHistory.append(track.palm)
+            if velocityHistory.count > DetectionConfig.Diagnostics.historyLength {
+                velocityHistory.removeFirst()
+                palmHistory.removeFirst()
+            }
+        }
 
         // 第四层：遮挡置信度。只在真实观测到手时刷新证据时间戳——
         // 无观测帧若也刷新，保留系数会恒为 1，导致状态永久卡在 alert。
@@ -277,6 +293,7 @@ final class HandProximityDetector: NSObject, ObservableObject {
         var hands: [HandObservation] = []
         var indexExtended = false
         var palmOpen = false
+        var perHandGestures: [(indexExtended: Bool, palmOpen: Bool)] = []
 
         do {
             try visionHandler.perform([handRequest], on: pixelBuffer, orientation: .up)
@@ -285,6 +302,8 @@ final class HandProximityDetector: NSObject, ObservableObject {
                 hands.append(analyzed.observation)
                 indexExtended = indexExtended || analyzed.indexExtended
                 palmOpen = palmOpen || analyzed.palmOpen
+                perHandGestures.append((
+                    indexExtended: analyzed.indexExtended, palmOpen: analyzed.palmOpen))
             }
             consecutiveErrors = 0
         } catch {
@@ -301,7 +320,8 @@ final class HandProximityDetector: NSObject, ObservableObject {
         return Perception(
             hands: hands,
             indexExtended: indexExtended,
-            palmOpen: palmOpen
+            palmOpen: palmOpen,
+            perHandGestures: perHandGestures
         )
     }
 
@@ -358,7 +378,7 @@ final class HandProximityDetector: NSObject, ObservableObject {
         let announced = inAlert && reportIssued
         let displayState = inAlert && !announced ? "接近中" : assessment.state.rawValue
 
-        let meta = Self.snapshotMeta(
+        let meta = snapshotMeta(
             assessment: assessment, strength: strength, time: time,
             observation: observation, features: features,
             approaching: features.approaching, retention: retention, primary: primary)
@@ -392,10 +412,12 @@ final class HandProximityDetector: NSObject, ObservableObject {
         var hands: [HandObservation] = []
         var indexExtended = false
         var palmOpen = false
+        /// 逐手姿态，仅供诊断；评分仍用上面两只手的全局 OR 口径，刻意分离。
+        var perHandGestures: [(indexExtended: Bool, palmOpen: Bool)] = []
     }
 
     /// 组装诊断快照的结构化数据，便于事后对照画面分析误报 / 漏报。
-    private static func snapshotMeta(
+    private func snapshotMeta(
         assessment: RiskAssessment,
         strength: CGFloat,
         time: TimeInterval,
@@ -406,6 +428,17 @@ final class HandProximityDetector: NSObject, ObservableObject {
         primary: HandTrack?
     ) -> [String: Any] {
         let signals = SignalSettings.current
+        // 逐手姿态单独记录：评分口径仍用全局 OR，两者刻意分离，便于核对
+        // 「另一只手的食指伸出是否被算到主目标头上」这类歧义。
+        let handsDetail = zip(observation.hands, observation.perHandGestures).map { hand, gesture in
+            [
+                "palm": [hand.palm.x, hand.palm.y],
+                "confidence": hand.confidence,
+                "indexExtended": gesture.indexExtended,
+                "palmOpen": gesture.palmOpen,
+                "scale": hand.boundingBox.width * hand.boundingBox.height
+            ] as [String: Any]
+        }
         var meta: [String: Any] = [
             "algorithm": "growth-first-v3",
             "signals": ["growth": signals.growth, "gesture": signals.gesture, "zone": signals.zone],
@@ -428,7 +461,12 @@ final class HandProximityDetector: NSObject, ObservableObject {
             "indexExtended": observation.indexExtended,
             "palmOpen": observation.palmOpen,
             "approaching": approaching,
-            "hasTrack": primary != nil
+            "hasTrack": primary != nil,
+            // 以下是本轮新增的观测字段，只增不改判定口径
+            "handCount": observation.hands.count,
+            "handsDetail": handsDetail,
+            "velocityHistory": velocityHistory,
+            "palmHistory": palmHistory.map { [$0.x, $0.y] }
         ]
         if let t = primary {
             meta["track"] = [

@@ -194,4 +194,12 @@ enum DetectionConfig {
         /// 手掌张开时相邻 MCP 间距之和下限。
         static let palmSpread: CGFloat = 0.16
     }
+
+    // MARK: - 诊断
+
+    /// 快照记录的最近帧数（约 0.4 秒 @30fps）。
+    /// 只用于事后对照「擦手持续高速」与「戳屏接近后停驻」，不参与任何评分或状态判定。
+    enum Diagnostics {
+        static let historyLength = 12
+    }
 }
