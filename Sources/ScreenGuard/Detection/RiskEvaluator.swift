@@ -28,7 +28,13 @@ final class RiskEvaluator {
     private var nearFrames = 0
     private var awayFrames = 0
     private var growthFrames = 0
+    private var alertFrames = 0
     private var latched = false
+
+    /// alert 最长保持帧数（@30fps 约 5 秒）。正常退出都在 1 秒内完成，
+    /// 这里只作为兜底：任何退出条件因边缘情况失效时，强制恢复，
+    /// 避免状态永久卡在 alert 导致后续接近再也无法触发提醒。
+    var maxAlertFrames = 150
 
     /// 输入特征、视觉置信度、遮挡保留系数，输出风险与状态
     func evaluate(
@@ -91,6 +97,7 @@ final class RiskEvaluator {
                 awayFrames = 0
                 if nearFrames >= 2 {
                     latched = true
+                    alertFrames = 0
                     newState = .alert
                 } else {
                     newState = .approaching
@@ -106,18 +113,23 @@ final class RiskEvaluator {
             }
         } else {
             // 已报警：维持提醒，直到手明确停住 / 远离 / 失去遮挡证据
+            alertFrames += 1
             let handSettled = signals.growth && hasObservation && features.growth < 0.1
             let noEvidence = !hasObservation && occlusionRetention <= 0.25
             let riskGone = hasObservation && risk <= threshold * 0.35
-            if handSettled || noEvidence || riskGone {
+            // 兜底：即使所有退出条件都因边缘情况失效，超过最长保持时间也强制恢复，
+            // 避免状态永久卡在「已提醒」而阻断后续提醒。
+            let timedOut = alertFrames >= maxAlertFrames
+            if handSettled || noEvidence || riskGone || timedOut {
                 awayFrames += 1
-                // 手停住给较长时间（约 0.67s）避免提醒一闪而过
-                let needed = handSettled ? 20 : (noEvidence ? 6 : 10)
+                // 手停住给较长时间（约 0.67s）避免提醒一闪而过；超时则一帧即恢复
+                let needed = timedOut ? 1 : (handSettled ? 20 : (noEvidence ? 6 : 10))
                 if awayFrames >= needed {
                     latched = false
                     nearFrames = 0
                     awayFrames = 0
                     growthFrames = 0
+                    alertFrames = 0
                     newState = .recovery
                 } else {
                     newState = .alert
@@ -147,6 +159,7 @@ final class RiskEvaluator {
         nearFrames = 0
         awayFrames = 0
         growthFrames = 0
+        alertFrames = 0
         latched = false
     }
 

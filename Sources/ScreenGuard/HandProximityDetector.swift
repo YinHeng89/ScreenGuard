@@ -296,7 +296,13 @@ final class HandProximityDetector: NSObject, ObservableObject {
 
         // 接近意图以「尺度持续变大」为核心；单纯速度快/方向对都不算接近
         let approaching = features.growth >= 0.2 && features.direction > 0.3
-        occlusion.observe(risk: riskHint, approaching: approaching, at: time)
+        // 关键：只在真实观测到手时才刷新遮挡证据时间戳。
+        // 若无观测帧也 observe，lastEvidenceAt 会被刷成当前帧，retainedRisk 的
+        // elapsed 恒为 0 → 永远返回 1 → alert 的 noEvidence 退出条件永不成立，
+        // 手一抽出画面状态就永久卡在「已提醒」，且冷却过后也无法再次触发。
+        if hasObservation {
+            occlusion.observe(risk: riskHint, approaching: approaching, at: time)
+        }
         let retention = occlusion.retainedRisk(at: time)
 
         // Layer 5：风险决策

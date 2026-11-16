@@ -173,6 +173,8 @@ idle（待机）→ observing（观察中）→ approaching（接近中）
 
 - 连续 2 帧满足门控 + 阈值才进入 `alert`（极强接近信号一帧记两票，一步即达，约 33ms）。
 - 已报警后，手停住约 0.67 秒、或彻底失去遮挡证据，才解除提醒，避免卡片一闪而过。
+- **遮挡证据只在真实观测到手的帧刷新**：无观测帧不更新时间戳，保留系数才能随离场时间衰减。若每帧都刷新，`retainedRisk` 会因 `elapsed=0` 恒为 1，导致手抽出画面后 alert 永久卡死、冷却过了也无法再次提醒。
+- **alert 超时兜底**：任何退出条件都因边缘情况失效时，最多保持 `maxAlertFrames`（默认 150 帧 ≈ 5 秒）即强制恢复，杜绝状态永久卡在「已提醒」而阻断后续提醒。
 - 视觉置信度与接触意图置信度共用同一套加权口径：两者都基于开启信号的加权分，区别仅在 `risk` 会再叠加遮挡保留与视觉置信度衰减，因此诊断 JSON 里的两个分数可直接对照。
 - **冷却期状态一致**：若判定已到 `alert` 但仍在提醒冷却中，界面显示「接近中」而非「已提醒」，只有真正弹窗后才置为「已提醒」，杜绝「状态已提醒却没弹窗」的误导。
 
@@ -290,6 +292,7 @@ swift -e 'import Foundation; DistributedNotificationCenter.default().postNotific
 | 阈值三档 | `RiskEvaluator.swift` / `HandProximityDetector.swift` | 灵敏度档位对应阈值 |
 | `maxMissedFrames` | `HandTrackingEngine.swift` | 遮挡预测最长保留帧数 |
 | `predictionWindow` | `OcclusionPredictor.swift` | 遮挡风险预测窗口 |
+| `maxAlertFrames` | `RiskEvaluator.swift` | alert 最长保持帧数（≈5 秒）兜底，防卡死 |
 | `dangerZoneTop` | `ScreenGeometry.swift` | 危险区起点高度（从 UserDefaults 读取，当前菜单无校准入口，默认 0.42） |
 | 采样间隔 | `HandProximityDetector.swift` | 当前约 30fps（33ms） |
 

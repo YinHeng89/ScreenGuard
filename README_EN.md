@@ -175,6 +175,8 @@ idle → observing → approaching → alert → recovery → idle
 
 - `alert` requires 2 consecutive frames passing both gate and threshold (an extremely strong approach signal counts double, reaching it in a single frame ≈ 33ms).
 - Once alerted, the card stays until the hand settles for ~0.67s or all occlusion evidence vanishes — preventing a flash-in-the-pan notification.
+- **Occlusion evidence is refreshed only on frames with a real hand observation.** Frames without observation never update the timestamp, so retention can decay as the hand leaves. If every frame refreshed it, `retainedRisk` would stay at 1 (`elapsed=0`) forever, leaving `alert` permanently stuck after the hand exits — blocking all future reminders.
+- **Alert timeout fallback**: if every exit condition fails due to an edge case, the state is forced back to recovery after `maxAlertFrames` (default 150 ≈ 5s), eliminating a permanent "Alerted" lock.
 - Visual confidence and intent confidence share the same weighted-feature basis: both derive from the enabled signals' weighted score; only `risk` additionally applies occlusion retention and visual-confidence damping, so the two numbers in the diagnostic JSON are directly comparable.
 - **Consistent cooldown state**: if the evaluator reaches `alert` while the reminder is still cooling down, the UI shows "Approaching" rather than "Alerted"; only an actually presented notification marks the state as "Alerted", eliminating the "alerted but no popup" mismatch.
 
@@ -292,6 +294,7 @@ swift -e 'import Foundation; DistributedNotificationCenter.default().postNotific
 | Three thresholds | `RiskEvaluator.swift` / `HandProximityDetector.swift` | Sensitivity levels |
 | `maxMissedFrames` | `HandTrackingEngine.swift` | Max frames of occlusion prediction |
 | `predictionWindow` | `OcclusionPredictor.swift` | Occlusion risk prediction window |
+| `maxAlertFrames` | `RiskEvaluator.swift` | Max frames an alert is held (≈5s) as a stuck-state fallback |
 | `dangerZoneTop` | `ScreenGeometry.swift` | Danger-zone start height (read from UserDefaults; no calibration UI in the menu, default 0.42) |
 | Sampling interval | `HandProximityDetector.swift` | Currently ~30fps (33ms) |
 
