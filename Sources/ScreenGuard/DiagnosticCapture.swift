@@ -32,11 +32,13 @@ final class DiagnosticCapture: @unchecked Sendable {
 
     // MARK: - 图像转换
 
+    /// CIContext 创建开销大，复用单例；调用只发生在 analysisQueue。
+    private static let sharedContext = CIContext()
+
     /// 把摄像头帧转成 PNG。必须在 pixelBuffer 有效的线程（analysisQueue）调用。
     static func pngData(from pixelBuffer: CVPixelBuffer) -> Data? {
         let image = CIImage(cvPixelBuffer: pixelBuffer)
-        let context = CIContext()
-        guard let cgImage = context.createCGImage(image, from: image.extent) else { return nil }
+        guard let cgImage = Self.sharedContext.createCGImage(image, from: image.extent) else { return nil }
         let rep = NSBitmapImageRep(cgImage: cgImage)
         return rep.representation(using: .png, properties: [:])
     }
@@ -46,7 +48,7 @@ final class DiagnosticCapture: @unchecked Sendable {
     /// 保存一次快照。图像与 JSON 使用同一时间戳前缀，便于配对查看。
     /// - Parameters:
     ///   - png: 摄像头帧 PNG 数据（可为 nil，仅存数据）
-    ///   - reason: "auto-alert"（自动报警）/ "manual"（手动记录）
+    ///   - reason: "alert"（自动报警）/ "manual"（手动记录）
     ///   - metadata: 检测数据字典
     func save(png: Data?, reason: String, metadata: [String: Any]) {
         guard isEnabled, let root = rootURL else { return }

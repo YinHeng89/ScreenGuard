@@ -3,11 +3,27 @@ import Combine
 import CoreVideo
 import Vision
 
-/// 检测系统协调者。
-/// 对外保持 @Published 状态与回调接口，内部编排采集、追踪、分析、遮挡预测与风险决策。
-/// 所有检测模块只在 analysisQueue 上访问；对外状态只在主线程写入。
+/// 单维度手部接近检测：手部在画面中的尺寸（包围盒对角线）达到阈值即报警。
+/// 判定只有一条链路 —— 看得见手、且手足够大（足够近）；不再有增长、方向、
+/// 姿态、区域、速度等多路评分。画面只在本机分析，不上传。
 final class HandProximityDetector: NSObject, ObservableObject {
     static let shared = HandProximityDetector()
+
+    // MARK: - 固定参数
+
+    private enum Config {
+        /// 灵敏度三档（保守 / 标准 / 灵敏）对应的尺寸阈值。
+        static let thresholds: [CGFloat] = [0.62, 0.48, 0.36]
+        /// 释放滞回系数：尺寸回落到阈值的该比例以下才允许下一轮报警。
+        static let releaseFactor: CGFloat = 0.78
+        /// 连续达标帧数（30fps 下约 100ms），抗单帧关键点抖动。
+        static let confirmFrames = 3
+        /// 帧处理最小间隔（纳秒），约 30fps。
+        static let frameIntervalNanos: UInt64 = 33_000_000
+        /// 手部关键点置信度下限与最少有效点数。
+        static let jointConfidence: Float = 0.3
+        static let minimumValidJoints = 6
+    }
 
     // MARK: - 采集
 
@@ -15,19 +31,12 @@ final class HandProximityDetector: NSObject, ObservableObject {
     private let videoOutput = AVCaptureVideoDataOutput()
     private let sessionQueue = DispatchQueue(label: "com.screenguard.session", qos: .userInitiated)
     private let analysisQueue = DispatchQueue(label: "com.screenguard.analysis", qos: .userInitiated)
-
     private let visionHandler = VNSequenceRequestHandler()
     private lazy var handRequest: VNDetectHumanHandPoseRequest = {
         let request = VNDetectHumanHandPoseRequest()
-        request.maximumHandCount = 2
+        request.maximumHandCount = 1
         return request
     }()
-
-    // MARK: - 检测模块
-
-    private let tracker = HandTrackingEngine()
-    private let occlusion = OcclusionPredictor()
-    private let evaluator = RiskEvaluator()
 
     // MARK: - 生命周期状态
 
@@ -36,42 +45,47 @@ final class HandProximityDetector: NSObject, ObservableObject {
     private var generation: UInt64 = 0
     private var desiredRunning = false
 
-    /// 只在 analysisQueue 内读写：start 后放行、stop/reset 时关闭，
-    /// 用于丢弃已入队的残留帧，避免切摄像头后的幽灵报警。
+    /// 只在 analysisQueue 内读写：丢弃 stop/切相机后已入队的残留帧。
     private var analysisActive = false
     private var lastProcessedUp: UInt64 = 0
+
+    // MARK: - 判定状态（只在 analysisQueue 内读写）
+
+    private var nearFrames = 0
+    private var awayFrames = 0
+    private var latched = false
     private var lastTriggerUp: UInt64 = 0
-    /// Vision 连续异常计数，累计到阈值时提示一次，恢复识别后清零。
-    private var consecutiveErrors = 0
 
-    /// 本轮接近是否已真正上报提醒。仅存在于 analysisQueue，
-    /// UI 状态由它派生，不反向读取主线程的 @Published 值。
-    private var reportIssued = false
-
-    // 诊断快照：最近一帧的像素缓冲与元数据，仅在 analysisQueue 读写
+    // 诊断快照缓存（只在 analysisQueue 内读写）
     private var lastPixelBuffer: CVPixelBuffer?
     private var lastFrameMeta: [String: Any] = [:]
-    /// 最近帧的速度与主目标手掌轨迹，仅写入诊断 JSON，不参与任何判定。
-    private var velocityHistory: [CGFloat] = []
-    private var palmHistory: [CGPoint] = []
 
-    // MARK: - 对外状态
+    // MARK: - 对外状态（只在主线程写）
 
     @Published private(set) var isMonitoring = false
     @Published private(set) var isClose = false
     @Published private(set) var detectionStrength: CGFloat = 0
-    @Published private(set) var indexExtended = false
-    @Published private(set) var approaching = false
-    @Published private(set) var zoneStrength: CGFloat = 0
-    @Published private(set) var stateText = "待机"
     @Published private(set) var statusText = "未启动"
+    @Published private(set) var stateText = "待机"
 
+    /// 报警触发回调。弹窗显示时长由 OverlayManager 自己控制， detector 不再管隐藏。
     var onTrigger: ((CGFloat) -> Void)?
-    var onClear: (() -> Void)?
 
     private static func uptimeNanos() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
     private static func seconds(_ nanos: UInt64) -> TimeInterval {
         TimeInterval(nanos) / 1_000_000_000
+    }
+
+    // MARK: - 用户设置
+
+    private func currentThreshold() -> CGFloat {
+        let raw = UserDefaults.standard.integer(forKey: "sensitivity")
+        return Config.thresholds[min(max(raw, 0), Config.thresholds.count - 1)]
+    }
+
+    private func currentCooldownNanos() -> UInt64 {
+        let seconds = max(UserDefaults.standard.integer(forKey: "cooldownSeconds"), 1)
+        return UInt64(seconds) * 1_000_000_000
     }
 
     // MARK: - 生命周期
@@ -115,12 +129,14 @@ final class HandProximityDetector: NSObject, ObservableObject {
         resetState()
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+            self.isMonitoring = false
+            self.isClose = false
+            self.detectionStrength = 0
+            self.stateText = "待机"
             self.statusText = "已暂停"
-            self.onClear?()
         }
     }
 
-    /// 原子递增 generation 并更新运行意图，返回新 token。
     private func beginTransition(desiredRunning: Bool) -> UInt64 {
         lifecycleLock.lock()
         defer { lifecycleLock.unlock() }
@@ -176,7 +192,7 @@ final class HandProximityDetector: NSObject, ObservableObject {
                     }
                     return
                 }
-                // 先激活分析队列再放行 UI：与帧处理同一队列，保证时序
+                // 先激活分析队列再放行 UI：与帧处理同队列，保证时序
                 self.analysisQueue.async { self.analysisActive = true }
                 self.isMonitoring = true
                 self.statusText = "监测中"
@@ -200,285 +216,126 @@ final class HandProximityDetector: NSObject, ObservableObject {
     }
 
     private func resetState() {
-        // 检测模块与诊断缓存全部只在 analysisQueue 内访问，复位必须串行到该队列。
         analysisQueue.async { [weak self] in
             guard let self else { return }
             self.analysisActive = false
-            self.tracker.clear()
-            self.occlusion.reset()
-            self.evaluator.reset()
-            self.reportIssued = false
+            self.nearFrames = 0
+            self.awayFrames = 0
+            self.latched = false
+            // 新一轮监测从零开始：否则切相机/重启后仍被上一轮的冷却压住，
+            // 最长一个 cooldown 周期内不报警。
+            self.lastTriggerUp = 0
+            self.lastProcessedUp = 0
             self.lastPixelBuffer = nil
             self.lastFrameMeta = [:]
-            self.velocityHistory = []
-            self.palmHistory = []
-            self.consecutiveErrors = 0
-        }
-        // @Published 状态统一回主线程写
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.isMonitoring = false
-            self.isClose = false
-            self.detectionStrength = 0
-            self.indexExtended = false
-            self.approaching = false
-            self.zoneStrength = 0
-            self.stateText = "待机"
         }
     }
 
-    // MARK: - 帧处理流水线
+    // MARK: - 帧处理
 
-    private func processFrame(_ pixelBuffer: CVPixelBuffer, at time: TimeInterval) {
-        // 第一层：视觉感知
-        let observation = perceive(pixelBuffer)
-
-        // 第二层：多目标追踪
-        let tracks = tracker.update(with: observation.hands, at: time)
-        let hasObservation = tracker.hasLiveObservation(
-            at: time, tolerance: DetectionConfig.Matching.observationTolerance)
-        let primary = tracks.max {
-            tracker.confidence(for: $0, at: time) < tracker.confidence(for: $1, at: time)
-        }
-        // 视觉置信度来自主目标轨迹：遮挡帧会按丢失时长指数衰减，而非感知层原始值。
-        let visualConfidence = primary.map { tracker.confidence(for: $0, at: time) } ?? 0
-
-        // 第三层：运动意图特征
-        let features = extractFeatures(primary: primary, observation: observation, time: time)
-
-        // 诊断时间序列：只在有主目标时成对记录，供事后区分「持续高速」与「接近后停驻」。
-        // 纯观测数据，不参与任何评分或状态判定。
-        if let track = primary {
-            velocityHistory.append(features.velocity)
-            palmHistory.append(track.palm)
-            if velocityHistory.count > DetectionConfig.Diagnostics.historyLength {
-                velocityHistory.removeFirst()
-                palmHistory.removeFirst()
-            }
-        }
-
-        // 第四层：遮挡置信度。只在真实观测到手时刷新证据时间戳——
-        // 无观测帧若也刷新，保留系数会恒为 1，导致状态永久卡在 alert。
-        if hasObservation {
-            let signals = SignalSettings.current
-            occlusion.observe(
-                risk: features.weightedScore(signals: signals),
-                approaching: features.approaching,
-                at: time
-            )
-        }
-        let retention = occlusion.retainedRisk(at: time)
-
-        // 第五层：风险决策
-        let assessment = evaluator.evaluate(
-            features: features,
-            visualConfidence: visualConfidence,
-            occlusionRetention: retention,
-            hasObservation: hasObservation
-        )
-
-        publish(
-            assessment: assessment,
-            features: features,
-            observation: observation,
-            primary: primary,
-            retention: retention,
-            pixelBuffer: pixelBuffer,
-            time: time
-        )
-    }
-
-    /// 第一层：用 Vision 提取手部关键点与姿态。
-    private func perceive(_ pixelBuffer: CVPixelBuffer) -> Perception {
-        var hands: [HandObservation] = []
-        var indexExtended = false
-        var palmOpen = false
-        var perHandGestures: [(indexExtended: Bool, palmOpen: Bool)] = []
-
+    /// 从 Vision 结果里取手部关键点的包围盒对角线，作为唯一的尺度信号。
+    private func measure(_ pixelBuffer: CVPixelBuffer) -> (span: CGFloat, confidence: Float, handCount: Int) {
         do {
             try visionHandler.perform([handRequest], on: pixelBuffer, orientation: .up)
-            for hand in handRequest.results ?? [] {
-                guard let analyzed = HandPoseAnalyzer.analyze(hand) else { continue }
-                hands.append(analyzed.observation)
-                indexExtended = indexExtended || analyzed.indexExtended
-                palmOpen = palmOpen || analyzed.palmOpen
-                perHandGestures.append((
-                    indexExtended: analyzed.indexExtended, palmOpen: analyzed.palmOpen))
-            }
-            consecutiveErrors = 0
         } catch {
-            // 单帧识别失败无需中断监测，下一帧会重试；持续异常才提示用户。
-            consecutiveErrors += 1
-            if consecutiveErrors >= DetectionConfig.errorNoticeThreshold {
-                consecutiveErrors = 0
-                DispatchQueue.main.async { [weak self] in
-                    self?.statusText = "识别暂时中断"
-                }
+            return (0, 0, 0)
+        }
+
+        var bestSpan: CGFloat = 0
+        var bestConfidence: Float = 0
+        var count = 0
+
+        for hand in handRequest.results ?? [] {
+            guard let points = try? hand.recognizedPoints(.all) else { continue }
+            let valid = points.values.filter { $0.confidence > Config.jointConfidence }
+            guard valid.count >= Config.minimumValidJoints else { continue }
+
+            let xs = valid.map { CGFloat($0.location.x) }
+            let ys = valid.map { CGFloat($0.location.y) }
+            guard let minX = xs.min(), let maxX = xs.max(),
+                  let minY = ys.min(), let maxY = ys.max() else { continue }
+
+            let span = min(max(hypot(maxX - minX, maxY - minY), 0), 1.5)
+            let confidence = valid.reduce(Float(0)) { $0 + $1.confidence } / Float(valid.count)
+            count += 1
+            if span > bestSpan {
+                bestSpan = span
+                bestConfidence = confidence
             }
         }
 
-        return Perception(
-            hands: hands,
-            indexExtended: indexExtended,
-            palmOpen: palmOpen,
-            perHandGestures: perHandGestures
-        )
+        return (bestSpan, bestConfidence, count)
     }
 
-    /// 第三层：从主目标轨迹计算评分特征。
-    private func extractFeatures(
-        primary: HandTrack?,
-        observation: Perception,
-        time: TimeInterval
-    ) -> FeatureSet {
-        guard let track = primary else { return FeatureSet() }
-
-        let anchor = track.indexTip ?? track.palm
-        let speed = track.velocity.length
-        let gesture = DetectionConfig.GestureScore.self
-        var features = FeatureSet()
-        features.direction = ScreenGeometry.directionScore(velocity: track.velocity, at: anchor)
-        // 速度来自关键点差分、抖动大，只写入诊断数据不参与评分
-        features.velocity = min(max(speed / DetectionConfig.velocityNormalizer, 0), 1)
-        features.gesture = (observation.indexExtended ? gesture.indexExtended : 0)
-            + (observation.palmOpen ? gesture.palmOpen : 0)
-        features.zone = ScreenGeometry.zoneScore(for: anchor)
-        features.growth = tracker.scaleGrowth(for: track)
-        return features
-    }
-
-    /// 把本帧结果转换为触发判定、诊断快照与主线程 UI 更新。
-    private func publish(
-        assessment: RiskAssessment,
-        features: FeatureSet,
-        observation: Perception,
-        primary: HandTrack?,
-        retention: CGFloat,
-        pixelBuffer: CVPixelBuffer,
-        time: TimeInterval
-    ) {
-        let strength = min(max(assessment.risk / DetectionConfig.threshold, 0), 1)
-        let inAlert = assessment.state == .alert
-        // 先捕获「上一帧是否已上报」：退出 alert 时靠它决定是否收起提醒。
-        let wasIssued = reportIssued
-
+    /// 唯一的判定逻辑：尺寸达标连续 N 帧即报警，回落到释放线以下才解锁。
+    private func evaluate(span: CGFloat, confidence: Float, handCount: Int) {
+        let threshold = currentThreshold()
+        let strength = min(max(span / threshold, 0), 1)
         let now = Self.uptimeNanos()
-        let cooldownOK = lastTriggerUp == 0
-            || now - lastTriggerUp >= DetectionConfig.cooldownNanos
-        let fired = inAlert && !wasIssued && cooldownOK
-        if fired {
-            lastTriggerUp = now
-            reportIssued = true
-        } else if !inAlert {
-            // 已退出 alert，允许下一轮接近再次上报
-            reportIssued = false
-        }
 
-        // 只有真正上报过才算「已提醒」；冷却期压住的 alert 显示「接近中」。
-        let announced = inAlert && reportIssued
-        let displayState = inAlert && !announced ? "接近中" : assessment.state.rawValue
+        var fired = false
+        if !latched {
+            if span >= threshold {
+                nearFrames += 1
+                awayFrames = 0
+                if nearFrames >= Config.confirmFrames {
+                    let cooldownOK = lastTriggerUp == 0
+                        || now - lastTriggerUp >= currentCooldownNanos()
+                    if cooldownOK {
+                        latched = true
+                        lastTriggerUp = now
+                        fired = true
+                    }
+                }
+            } else {
+                nearFrames = 0
+            }
+        } else if span <= threshold * Config.releaseFactor {
+            awayFrames += 1
+            nearFrames = 0
+            if awayFrames >= Config.confirmFrames {
+                latched = false
+                awayFrames = 0
+            }
+        } else {
+            awayFrames = 0
+        }
 
         let meta = snapshotMeta(
-            assessment: assessment, strength: strength, time: time,
-            observation: observation, features: features,
-            approaching: features.approaching, retention: retention, primary: primary)
+            span: span, threshold: threshold, strength: strength,
+            confidence: confidence, handCount: handCount)
+        lastFrameMeta = meta
         if fired {
             DiagnosticCapture.shared.save(
-                png: DiagnosticCapture.pngData(from: pixelBuffer), reason: "alert", metadata: meta)
+                png: lastPixelBuffer.flatMap { DiagnosticCapture.pngData(from: $0) },
+                reason: "alert", metadata: meta)
         }
-        // 缓存最近一帧供「手动记录」使用（漏报分析）
-        lastPixelBuffer = pixelBuffer
-        lastFrameMeta = meta
 
+        let close = latched
+        let state = latched ? "已提醒" : (span >= threshold ? "接近中" : "监测中")
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.detectionStrength = strength
-            self.indexExtended = observation.indexExtended
-            self.approaching = features.approaching
-            self.zoneStrength = features.zone
-            self.isClose = announced
-            self.stateText = displayState
-
-            if fired {
-                self.onTrigger?(assessment.risk)
-            } else if !inAlert && wasIssued {
-                self.onClear?()
-            }
+            self.isClose = close
+            self.stateText = state
+            if fired { self.onTrigger?(strength) }
         }
     }
 
-    /// 本帧视觉感知结果。
-    private struct Perception {
-        var hands: [HandObservation] = []
-        var indexExtended = false
-        var palmOpen = false
-        /// 逐手姿态，仅供诊断；评分仍用上面两只手的全局 OR 口径，刻意分离。
-        var perHandGestures: [(indexExtended: Bool, palmOpen: Bool)] = []
-    }
-
-    /// 组装诊断快照的结构化数据，便于事后对照画面分析误报 / 漏报。
     private func snapshotMeta(
-        assessment: RiskAssessment,
-        strength: CGFloat,
-        time: TimeInterval,
-        observation: Perception,
-        features: FeatureSet,
-        approaching: Bool,
-        retention: CGFloat,
-        primary: HandTrack?
+        span: CGFloat, threshold: CGFloat, strength: CGFloat,
+        confidence: Float, handCount: Int
     ) -> [String: Any] {
-        let signals = SignalSettings.current
-        // 逐手姿态单独记录：评分口径仍用全局 OR，两者刻意分离，便于核对
-        // 「另一只手的食指伸出是否被算到主目标头上」这类歧义。
-        let handsDetail = zip(observation.hands, observation.perHandGestures).map { hand, gesture in
-            [
-                "palm": [hand.palm.x, hand.palm.y],
-                "confidence": hand.confidence,
-                "indexExtended": gesture.indexExtended,
-                "palmOpen": gesture.palmOpen,
-                "scale": hand.boundingBox.width * hand.boundingBox.height
-            ] as [String: Any]
-        }
-        var meta: [String: Any] = [
-            "algorithm": "growth-first-v3",
-            "signals": ["growth": signals.growth, "gesture": signals.gesture, "zone": signals.zone],
-            "uptimeSec": time,
-            "state": assessment.state.rawValue,
-            "risk": assessment.risk,
+        [
+            "algorithm": "single-span-v4",
+            "span": span,
+            "threshold": threshold,
             "strength": strength,
+            "handCount": handCount,
+            "confidence": confidence,
             "sensitivityLevel": UserDefaults.standard.integer(forKey: "sensitivity"),
-            "threshold": DetectionConfig.threshold,
-            "visualConfidence": assessment.visualConfidence,
-            "intentConfidence": assessment.intentConfidence,
-            "occlusionRetention": retention,
-            "feature_direction": features.direction,
-            "feature_velocity": features.velocity,
-            "feature_gesture": features.gesture,
-            "feature_zone": features.zone,
-            "feature_growth": features.growth,
-            "gateOpen": assessment.approachGateOpen,
-            "growthFrames": assessment.sustainedGrowthFrames,
-            "indexExtended": observation.indexExtended,
-            "palmOpen": observation.palmOpen,
-            "approaching": approaching,
-            "hasTrack": primary != nil,
-            // 以下是本轮新增的观测字段，只增不改判定口径
-            "handCount": observation.hands.count,
-            "handsDetail": handsDetail,
-            "velocityHistory": velocityHistory,
-            "palmHistory": palmHistory.map { [$0.x, $0.y] }
+            "latched": latched
         ]
-        if let t = primary {
-            meta["track"] = [
-                "velocity": [t.velocity.x, t.velocity.y],
-                "indexTip": t.indexTip.map { [$0.x, $0.y] } ?? NSNull(),
-                "palm": [t.palm.x, t.palm.y],
-                "missedFrames": t.missedFrames,
-                "confidence": t.confidence,
-                "scaleHistory": t.scaleHistory
-            ] as [String: Any]
-        }
-        return meta
     }
 
     /// 手动记录当前画面（用于分析漏报：手确实戳了但没触发报警）。
@@ -505,17 +362,19 @@ extension HandProximityDetector: AVCaptureVideoDataOutputSampleBufferDelegate {
         didOutput sampleBuffer: CMSampleBuffer,
         from connection: AVCaptureConnection
     ) {
-        // 丢弃 stop/切相机后已入队的残留帧：这些帧会用被清空的状态误判。
-        // analysisActive 与本回调同在 analysisQueue，无数据竞争。
+        // 丢弃 stop/切相机后已入队的残留帧
         guard analysisActive else { return }
 
         let now = Self.uptimeNanos()
-        if lastProcessedUp != 0 && now - lastProcessedUp < DetectionConfig.frameIntervalNanos {
+        if lastProcessedUp != 0 && now - lastProcessedUp < Config.frameIntervalNanos {
             return
         }
         lastProcessedUp = now
 
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        processFrame(pixelBuffer, at: Self.seconds(now))
+        lastPixelBuffer = pixelBuffer
+
+        let measured = measure(pixelBuffer)
+        evaluate(span: measured.span, confidence: measured.confidence, handCount: measured.handCount)
     }
 }

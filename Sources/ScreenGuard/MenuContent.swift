@@ -12,10 +12,6 @@ struct MenuContent: View {
     @AppStorage("cooldownSeconds") private var cooldownSeconds = 5
     @AppStorage("selectedCameraID") private var selectedCameraID = ""
     @AppStorage("reminderCount") private var reminderCount = 0
-    // 三路信号开关：关掉的通道不计分，权重按比例分给其余开启项
-    @AppStorage("signalGrowthEnabled") private var growthEnabled = true
-    @AppStorage("signalGestureEnabled") private var gestureEnabled = true
-    @AppStorage("signalZoneEnabled") private var zoneEnabled = true
     // 诊断快照开关（临时功能，后期可整体删除）
     @AppStorage("diagnosticCaptureEnabled") private var diagnosticEnabled = true
 
@@ -53,32 +49,6 @@ struct MenuContent: View {
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
                     .frame(width: 30, alignment: .trailing)
-            }
-
-            VStack(alignment: .leading, spacing: 6) {
-                Text("参与评分的信号")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(.tertiary)
-
-                VStack(spacing: 7) {
-                    signalRow("食指伸出", isOn: $gestureEnabled)
-                        .onChange(of: gestureEnabled) { _, _ in
-                            if !growthEnabled && !gestureEnabled && !zoneEnabled { gestureEnabled = true }
-                        }
-                    signalRow("正在靠近", isOn: $growthEnabled)
-                        .onChange(of: growthEnabled) { _, _ in
-                            if !growthEnabled && !gestureEnabled && !zoneEnabled { growthEnabled = true }
-                        }
-                    signalRow("接近区", isOn: $zoneEnabled)
-                        .onChange(of: zoneEnabled) { _, _ in
-                            if !growthEnabled && !gestureEnabled && !zoneEnabled { zoneEnabled = true }
-                        }
-                }
-
-                Text("关闭某路信号后，其权重分给其余项。「正在靠近」同时包含尺度增长与运动方向，关掉后不再要求手持续变大，误报会上升。")
-                    .font(.system(size: 9.5))
-                    .foregroundStyle(.tertiary)
-                    .fixedSize(horizontal: false, vertical: true)
             }
 
             Divider()
@@ -195,11 +165,6 @@ struct MenuContent: View {
         .background(Color(nsColor: .windowBackgroundColor))
         .background(MenuPanelBackgroundFixer())
         .onAppear {
-            // 数据层兜底校正：若三路信号曾被写到全关，这里回写保证 UI 与评分一致
-            SignalSettings.sanitizePersisted()
-            growthEnabled = SignalSettings.current.growth
-            gestureEnabled = SignalSettings.current.gesture
-            zoneEnabled = SignalSettings.current.zone
             cameras = discoverCameras()
             snapshotCount = DiagnosticCapture.shared.count
         }
@@ -263,21 +228,6 @@ struct MenuContent: View {
                 .foregroundStyle(.secondary)
         }
         .frame(height: 18)
-    }
-
-    /// 单个信号：左右结构，文字在前、迷你 switch 在后，右对齐。
-    private func signalRow(_ title: String, isOn: Binding<Bool>) -> some View {
-        HStack {
-            Text(title)
-                .font(.system(size: 11))
-                .foregroundStyle(isOn.wrappedValue ? .primary : .tertiary)
-                .lineLimit(1)
-            Spacer(minLength: 8)
-            Toggle("", isOn: isOn)
-                .toggleStyle(.switch)
-                .controlSize(.mini)
-                .labelsHidden()
-        }
     }
 
     private func discoverCameras() -> [AVCaptureDevice] {

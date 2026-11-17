@@ -38,14 +38,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
 
         let detector = HandProximityDetector.shared
-        detector.onTrigger = { span in
-            OverlayManager.shared.present(intensity: span)
+        detector.onTrigger = { strength in
+            OverlayManager.shared.present(intensity: strength)
             let count = UserDefaults.standard.integer(forKey: "reminderCount") + 1
             UserDefaults.standard.set(count, forKey: "reminderCount")
         }
-        detector.onClear = {
-            OverlayManager.shared.dismiss()
-        }
+        // 刻意不接 onClear：弹窗一旦弹出只按 OverlayManager 的 4.5 秒倒计时隐藏，
+        // 手提前移开也不会收起。
 
         DistributedNotificationCenter.default().addObserver(
             forName: NSNotification.Name("com.screenguard.preview"),

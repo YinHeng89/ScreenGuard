@@ -49,11 +49,11 @@ So ScreenGuard's positioning has become slightly delicate: it guards against **s
 
 | Feature | Details |
 | --- | --- |
-| Visual proximity detection | Apple Vision framework detects hand and upper-body keypoints to judge approach |
-| Scale-growth gate | Alerts only when the hand keeps getting *larger* (coming closer); raising or opening a hand won't trigger it |
-| Multi-pose / multi-direction | Not tied to a single gesture — palm, arm, and left/right approaches all contribute evidence |
+| Visual proximity detection | Apple Vision detects the hand; a single dimension — its size in frame (distance) — decides |
+| Single criterion | Alert when the hand is large enough; 3-frame confirmation and hysteresis, no multi-dimension scoring |
 | Polished floating card | Dark glass look + purple/cyan gradient + pulsing halo + countdown bar; never steals focus or blocks clicks |
-| Three sensitivity levels | Conservative / Standard / Sensitive, mapped to different risk thresholds |
+| Popup never dismissed early | Fixed 4.5s display once triggered, even if the hand moves away; hides only when the countdown ends |
+| Three sensitivity levels | Conservative / Standard / Sensitive, mapped to different size thresholds |
 | Adjustable cooldown | 3 / 5 / 8 / 12 seconds to avoid nagging |
 | Camera selection | Auto / built-in / external / Continuity Camera (iPhone) |
 | Diagnostic snapshots | Auto-save frame + data on alert for analyzing false positives/negatives (fully removable) |
@@ -98,91 +98,34 @@ The app then lives in your menu bar as a hand icon: `✋` (monitoring) / `🚫` 
 
 ## How It Works
 
-ScreenGuard turns camera frames into an alert decision through a **layered detection pipeline**. This version has been simplified: only signals that actually drive the decision remain; the idle upper-body branch and the noisy velocity score have been removed.
+ScreenGuard now has **one decision path**: if a hand is visible and large enough in the frame (close enough), alert.
 
 ```
-┌─────────────────────────────────────────────┐
-│ Layer 1  Visual Perception                    │
-│  VNDetectHumanHandPoseRequest (up to 2 hands)  │
-└──────────────────┬──────────────────────────┘
-                   ↓
-┌─────────────────────────────────────────────┐
-│ Layer 2  Multi-target Tracking                 │
-│  Cross-frame nearest-neighbor, velocity-extrapolated │
-│  matching, smoothed tracks, 8-frame scale window    │
-│  A lost keypoint ≠ a lost target                    │
-└──────────────────┬──────────────────────────┘
-                   ↓
-┌─────────────────────────────────────────────┐
-│ Layer 3  Motion & Intent Analysis              │
-│  Growth / zone / gesture / direction (velocity diagnostic-only) │
-└──────────────────┬──────────────────────────┘
-                   ↓
-┌─────────────────────────────────────────────┐
-│ Layer 4  Occlusion Prediction                  │
-│  Short-horizon constant-velocity + acceleration │
-│  prediction, exponential confidence decay       │
-│  Core principle: hand gone ≠ danger over        │
-└──────────────────┬──────────────────────────┘
-                   ↓
-┌─────────────────────────────────────────────┐
-│ Layer 5  Risk Decision — state machine          │
-│  Growth-first scoring + hard growth gate         │
-│  + cooldown + hysteresis                        │
-└─────────────────────────────────────────────┘
+Camera (~30fps)
+  → Vision finds a hand, measures its keypoint bounding-box diagonal (span)
+  → span ≥ threshold for 3 consecutive frames → alert
+  → moving the hand away does NOT dismiss the popup;
+    it hides itself after a 4.5s countdown
 ```
 
-### The key idea: the scale-growth gate
+Earlier versions stacked five layers (multi-target tracking, scale-growth gate, velocity extrapolation, pose, danger zone, occlusion prediction, a six-state machine, 20+ parameters). Real-world testing showed that with a monocular camera, "the hand grows in frame" means both reaching for the screen and rubbing your hands together — and the extra signals also scored high on false positives. The complexity never bought accuracy and kept producing patches and bugs. All of it is now deleted: the detector went from ~1400 lines across seven files to ~300 lines in one.
 
-This is the single most important — and most iterated — rule in the system:
+### The only criterion: hand size in frame
 
-> **Only alert when the hand's bounding box has been continuously growing over multiple frames.**
+`VNDetectHumanHandPoseRequest` finds a hand, then the bounding-box diagonal of its confident keypoints gives `span` (normalized, 0~1.5). With a monocular camera, distance and apparent size are roughly equivalent: **the closer the hand, the larger it appears**.
 
-| Motion | Scale history | Alert? |
-| --- | --- | --- |
-| Hand moving from far toward the screen | Area grows monotonically across frames | Yes |
-| Raising a hand / opening the palm | Area jumps once, then stays flat | No |
-| Hand held still in the air | Area barely changes | No |
-| Hand moving away from the camera | Negative growth | No |
+| Stage | Rule |
+| --- | --- |
+| Threshold | Conservative `0.62` / Standard `0.48` / Sensitive `0.36`, from the menu |
+| Trigger | `span ≥ threshold` for 3 consecutive frames (~100ms at 30fps), to reject single-frame jitter |
+| Release | `span ≤ threshold × 0.78` for 3 consecutive frames; hysteresis prevents flapping |
+| Cooldown | The "Reminder interval" setting (3/5/8/12s) gates successive alerts |
 
-`HandTrackingEngine.scaleGrowth(for:)` examines the bounding-box area over the last 8 frames: it returns a positive growth score only if the area is more than 6% larger than the first frame, the absolute delta is at least 0.004, each step grows by > 0.8%, and at least 55% of the steps are increases. `RiskEvaluator` then requires growth ≥ 0.22 for 2 consecutive frames before opening the gate. The gate is a **necessary condition** for `alert` — no matter how fast the motion or how gesture-like the pose, without the gate nothing fires. The absolute-delta floor filters out "percentage growth" caused by keypoint jitter; the continuity floor was relaxed from 65% to 55% to tolerate an occasional area dip during a quick poke, while a one-off jump from raising an open palm still fails the continuity check.
+`confidence` and `handCount` only confirm "a hand was actually seen this frame" and are logged for diagnostics — they never affect scoring. There is no growth, direction, pose, zone, or velocity dimension, and no state machine.
 
-### Risk scoring
+### Popup behavior
 
-Only discriminative signals are scored (weights sum to 1):
-
-| Feature | Weight | Meaning |
-| --- | --- | --- |
-| `growth` | 0.62 | Is the hand continuously growing (the core prerequisite, dominant) |
-| `zone` | 0.18 | Inside the lower danger zone |
-| `gesture` | 0.12 | Pointing / open-hand pose (weak aid) |
-| `direction` | 0.08 | Is motion heading toward the screen region (weak aid) |
-
-`velocity` is still computed and written to the diagnostic JSON but **does not affect scoring**: at 30fps, a two-frame keypoint difference amplifies jitter into high speed, which was the main noise source behind false positives. The upper-body extension branch and its weight redistribution have been removed entirely, since the feature is constantly 0 in normal seated use.
-
-**Three signal toggles**: the `Index extended` / `Approaching` / `Danger zone` tags in the menu are clickable switches mapped to `gesture` / `growth + direction` / `zone`. Turning one off zeroes its weight and re-normalizes the remaining enabled weights to sum to 1 — e.g. with `Danger zone` off, the weights become growth ≈0.76 / direction ≈0.10 / gesture ≈0.15.
-
-The system **enforces at least one enabled signal** at the data layer: `SignalSettings.current` falls back to enabling `Approaching` even if all three were persisted as off, avoiding a zero scoring denominator that would silence monitoring permanently; opening the menu also writes this fallback back to correct the UI. Note: `direction` has no independent toggle and belongs to `Approaching` — turning it off also disables the direction feature and the hard scale-growth gate, so alerts then rely only on zone and gesture and **false positives will rise noticeably**.
-
-Thresholds by sensitivity: **Conservative 0.62 / Standard 0.48 / Sensitive 0.36**. The confirmation window was tightened from 3 to 2 frames; strong growth inside the danger zone fires in a single frame so quick pokes are not missed.
-
-**Two anti-jitter measures** (for "unstable triggering"):
-- Visual confidence is applied gently: `0.7 + 0.3 × vc` (previously `0.45 + 0.55 × vc`). Fast motion makes Vision confidence drop sharply; the old factor cut risk by 44% at vc=0.2, pushing a legitimate approach below the threshold. At worst 70% of the risk is now retained.
-- The final risk is a **3-frame moving average** before threshold comparison, removing single-frame spikes and threshold see-saw from the binary index-extended test and keypoint jitter. When the window is not yet full, the average uses the actual frame count so a strong first frame is never diluted. `intentConfidence` remains the unsmoothed, undamped pure feature score, useful for comparing "raw intent" against "decision risk" in diagnostics.
-
-### State machine
-
-```
-idle → observing → approaching → alert → recovery → idle
-                 ↘ occluded (optional, not a required stage)
-```
-
-- `alert` requires 2 consecutive frames passing both gate and threshold (an extremely strong approach signal counts double, reaching it in a single frame ≈ 33ms).
-- Once alerted, the card stays until the hand settles for ~0.67s or all occlusion evidence vanishes — preventing a flash-in-the-pan notification.
-- **Occlusion evidence is refreshed only on frames with a real hand observation.** Frames without observation never update the timestamp, so retention can decay as the hand leaves. If every frame refreshed it, `retainedRisk` would stay at 1 (`elapsed=0`) forever, leaving `alert` permanently stuck after the hand exits — blocking all future reminders.
-- **Alert timeout fallback**: if every exit condition fails due to an edge case, the state is forced back to recovery after `maxAlertFrames` (default 90 ≈ 3s), eliminating a permanent "Alerted" lock.
-- Visual confidence and intent confidence share the same weighted-feature basis: both derive from the enabled signals' weighted score. `risk` additionally applies occlusion retention, gentle visual-confidence damping, and a 3-frame moving average, while `intentConfidence` stays raw — the gap between them in the diagnostic JSON shows how much "raw intent" was attenuated before the decision.
-- **Consistent cooldown state**: if the evaluator reaches `alert` while the reminder is still cooling down, the UI shows "Approaching" rather than "Alerted"; only an actually presented notification marks the state as "Alerted", eliminating the "alerted but no popup" mismatch.
+Once triggered, the popup stays for **4.5 seconds**, with the progress bar counting down in sync. Moving or removing the hand, or resetting detector state, never dismisses it early — the detector deliberately registers no `dismiss` callback of any kind. Hiding is solely the `OverlayManager` countdown timer's job. This is also the simplest possible fix for the old "stuck on Alerted" bug: there is no state machine left to get stuck in.
 
 ### Concurrency & lifecycle
 
@@ -205,24 +148,15 @@ ScreenGuard/
 │   └── 图标预览.png                        # Icon preview (README image)
 ├── Sources/ScreenGuard/
 │   ├── main.swift                         # Entry point, menu bar, lifecycle, debug notifications
-│   ├── HandProximityDetector.swift        # Coordinator: orchestrates capture + modules, stable API
+│   ├── HandProximityDetector.swift        # All detection: capture + single-dimension decision + diagnostics
 │   ├── MenuContent.swift                  # Menu bar settings UI
-│   ├── OverlayManager.swift               # Floating alert window + card visuals
-│   ├── DiagnosticCapture.swift            # Diagnostic snapshots (standalone, removable)
-│   ├── Models/
-│   │   ├── DetectionModels.swift          # HandTrack / state / assessment / features + shared scoring
-│   │   └── DetectionConfig.swift          # Single source of truth for all tunable parameters
-│   └── Detection/
-│       ├── HandPoseAnalyzer.swift         # Hand keypoints, index extension, palm openness
-│       ├── HandTrackingEngine.swift       # Multi-target association, smoothing, scale growth
-│       ├── OcclusionPredictor.swift       # Occlusion risk hold / decay
-│       ├── ScreenGeometry.swift           # Normalized danger-zone model
-│       └── RiskEvaluator.swift            # Weighted scoring + explicit state machine
+│   ├── OverlayManager.swift               # Floating alert window + card visuals + 4.5s countdown
+│   └── DiagnosticCapture.swift            # Diagnostic snapshots (standalone, removable)
 └── build/                                 # Build output (git-ignored)
     └── 屏幕守卫.app
 ```
 
-**Stable external interface**: `HandProximityDetector` communicates with the UI through `@Published` state and `onTrigger` / `onClear` callbacks, so the detection engine can be swapped without touching the UI layer.
+**External interface**: `HandProximityDetector` communicates with the UI through `@Published` state and an `onTrigger` callback. Everything lives in one file; the decision logic is in one place.
 
 ---
 
@@ -233,8 +167,7 @@ Click the hand icon in the menu bar:
 | Option | Details |
 | --- | --- |
 | Enable gesture monitoring | Master switch; turning it off stops the camera and clears state |
-| Detection strength bar | Live risk vs. threshold; turns orange/pink near trigger |
-| Signal toggles | `Index extended` / `Approaching` / `Danger zone` — uniform mini switches that can be toggled both ways; weights are redistributed among enabled signals |
+| Detection strength bar | Live hand size vs. threshold; turns orange/pink near trigger |
 | Sensitivity | Conservative / Standard / Sensitive |
 | Reminder interval | 3 / 5 / 8 / 12 seconds |
 | Sound | Toggle the soft Tink on trigger |
@@ -253,11 +186,7 @@ A temporary feature built for tuning. On each alert it saves the camera frame pl
 - Automatic rolling cleanup: **only the latest 10 snapshots are kept**; older ones are removed on the next save — no manual maintenance needed
 - **Auto snapshot**: saved on alert, for analyzing false positives
 - **Record current**: manual button, for analyzing missed detections (hand touched but no alert)
-- JSON includes: algorithm version, risk, threshold, growth/zone/gesture/direction features, velocity (diagnostic only), dual confidences, occlusion retention, gate state, scale history, track details
-- Three added observation fields for telling " wiping hands" false positives from real screen pokes (**logged only, never scored**):
-  - `handCount` / `handsDetail`: how many hands were detected and each hand's own pose/scale — useful to check whether hand-rubbing involved two hands, or whether one hand's pose was wrongly attributed to the tracked target.
-  - `velocityHistory`: normalized speed over the last ~12 frames (≈0.4s). Wiping tends to stay fast; a real poke decelerates on contact.
-  - `palmHistory`: palm coordinates over the same window, paired 1:1 with `velocityHistory`, so the trajectory's "dwell" at contact can be inspected.
+- JSON fields (`algorithm: single-span-v4`): `span` hand size in frame, `threshold` active threshold, `strength` span/threshold ratio, `handCount` hands detected, `confidence` mean keypoint confidence, `sensitivityLevel`, `latched` decision state. No multi-dimension scoring fields.
 
 **To remove entirely**: delete `DiagnosticCapture.swift` and the handful of call sites in `HandProximityDetector`, `MenuContent.swift`, and `main.swift`. Nothing else is affected. With the menu toggle off, nothing is written to disk.
 
@@ -295,21 +224,18 @@ swift -e 'import Foundation; DistributedNotificationCenter.default().postNotific
 
 ### Tunable parameters
 
-All algorithm parameters live in one place: **`Sources/ScreenGuard/Models/DetectionConfig.swift`**, grouped by "capture / scoring / state machine / occlusion / tracking / geometry / pose", each with a note on its role. Detection modules only reference these semantic constants; no scattered magic numbers remain. Tuning means editing this single file — there is no longer any risk of changing one copy of a threshold while missing another.
+All decision parameters are in the `Config` enum at the top of `HandProximityDetector.swift` — six constants total:
 
-| Group | Key constants | Effect |
+| Constant | Default | Effect |
 | --- | --- | --- |
-| Capture | `sensitivityLevels` / `frameIntervalNanos` / `cooldownNanos` | Three thresholds, sampling interval (~30fps / 33ms), cooldown floor |
-| Scoring | `Weights` / `confidenceFloor`+`confidenceSlope` / `riskWindowSize` | Feature weights (menu toggles re-normalize them), confidence suppression, moving-average window |
-| State machine | `growthGate` / `growthFramesNeeded` / `FastApproach` / `ExitFrames` / `maxAlertFrames` | Gate tightness (raise if false positives, lower if missed), fast path, exit frame counts, max alert hold (~3s fallback against stuck state) |
-| Occlusion | `Occlusion.window` / `holdFloor` / `decayRate` / `exhausted` | Risk hold window and decay |
-| Tracking | `maxMissedFrames` / `Matching` / `Smoothing` / `Growth` | Occlusion prediction frames, data association, velocity smoothing, scale-growth gates |
-| Geometry | `dangerZoneTop` / `Zone` / `Direction` | Danger-zone start (default 0.42) and direction scoring |
-| Pose | `jointConfidence` / `Gesture` | Keypoint confidence, index/palm detection |
+| `thresholds` | `[0.62, 0.48, 0.36]` | Size threshold per sensitivity level; raise if false positives, lower if missed |
+| `releaseFactor` | `0.78` | Hysteresis for release; too low flaps, too high delays release |
+| `confirmFrames` | `3` | Consecutive frames for trigger/release; lower is more sensitive but jitterier |
+| `frameIntervalNanos` | 33ms | Sampling interval (~30fps) |
+| `jointConfidence` | `0.3` | Minimum keypoint confidence |
+| `minimumValidJoints` | `6` | Minimum valid keypoints to count as "hand seen" |
 
-The three `signal*Enabled` toggles are still controlled from the menu; their persisted keys are in `MenuContent.swift` / `DetectionModels.swift`.
-
-> Parameter values are unchanged from before this refactor — the only change is consolidating them from five files into one. See inline comments in `DetectionConfig.swift`.
+The popup's 4.5s duration appears twice — `OverlayManager.present()` and the `AlertCardView` progress animation — and must be changed together.
 
 ---
 
@@ -319,15 +245,13 @@ The three `signal*Enabled` toggles are still controlled from the menu; their per
 
 - **Camera blind spots**: the MacBook camera sits above the screen facing the user. Hands approaching from the side or below, or already touching the panel, may be invisible — and what the camera can't see can't be predicted. That's physics.
 - **Lighting and background**: low light, cluttered backgrounds, and strong backlight reduce Vision keypoint confidence.
-- **Velocity noise**: a two-frame keypoint difference is jittery during fast motion. Velocity is now diagnostic-only; if false positives persist, raise `growthGate` rather than restoring velocity weight.
+- **False positives are inherent to a single dimension**: raising a hand or opening the palm triggers an alert — with one dimension there is no way to tell "held still" from "reaching for the screen." This trade-off is deliberate.
+- **Lighting and occlusion**: low light or cluttered backgrounds degrade Vision keypoints; if fewer than the minimum valid keypoints are visible, the frame counts as "no hand."
 
-**Deliberately not implemented (to avoid piling on algorithms that obscure the source of false positives):**
+**Deliberately not implemented (single-dimension by design):**
 
-- Optical flow tracking (`VNGenerateOpticalFlowRequest` / `VNTrackObjectRequest`)
-- Kalman filtering (currently constant velocity + acceleration + exponential decay)
-- Visual calibration wizard (`ScreenGeometry` has the model and persistence, but no UI)
-- Core ML hand object detection (occlusion fallback)
-- True 3D depth estimation (monocular limitation; approximated with 2D normalized coordinates)
+- Multi-target tracking, scale-growth gate, velocity/direction/pose/zone scoring, occlusion prediction, risk state machine — all removed, not coming back.
+- Core ML hand detection, optical flow, Kalman filtering, 3D depth estimation.
 - Dedicated tests for lighting robustness, long-run power draw, per-device multi-display placement
 
 **Conclusion of the non-visual research** (for reference): Macs ship no LiDAR; ambient light sensors are slow and easily confused by lighting; acoustic sonar is a research prototype; an external ToF depth sensor (e.g. VL53L5CX) is the most credible alternative, but requires extra hardware.
