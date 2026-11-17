@@ -59,6 +59,7 @@ final class HandProximityDetector: NSObject, ObservableObject {
     // 诊断快照缓存（只在 analysisQueue 内读写）
     private var lastPixelBuffer: CVPixelBuffer?
     private var lastFrameMeta: [String: Any] = [:]
+    private var lastPreviewSize: CGSize = .zero
 
     // MARK: - 对外状态（只在主线程写）
 
@@ -67,6 +68,15 @@ final class HandProximityDetector: NSObject, ObservableObject {
     @Published private(set) var detectionStrength: CGFloat = 0
     @Published private(set) var statusText = "未启动"
     @Published private(set) var stateText = "待机"
+
+    // 菜单栏实时预览用的观测数据（只读，全部由主线程发布）
+    @Published private(set) var detectedBox: CGRect = .zero
+    @Published private(set) var handCount = 0
+    @Published private(set) var previewSize: CGSize = CGSize(width: 16, height: 9)
+    @Published private(set) var previewMirrored = false
+
+    /// 只读会话供菜单栏预览层使用；配置仍全部在 sessionQueue 完成。
+    var captureSession: AVCaptureSession { session }
 
     /// 报警触发回调。弹窗显示时长由 OverlayManager 自己控制， detector 不再管隐藏。
     var onTrigger: ((CGFloat) -> Void)?
@@ -132,6 +142,9 @@ final class HandProximityDetector: NSObject, ObservableObject {
             self.isMonitoring = false
             self.isClose = false
             self.detectionStrength = 0
+            self.detectedBox = .zero
+            self.handCount = 0
+            self.previewMirrored = false
             self.stateText = "待机"
             self.statusText = "已暂停"
         }
@@ -184,6 +197,14 @@ final class HandProximityDetector: NSObject, ObservableObject {
 
             self.session.commitConfiguration()
             self.session.startRunning()
+            // Vision 始终按原始像素坐标给框；previewMirrored 只供预览层镜像
+            // 与识别框 x 翻转共用，保证两者对齐。
+            let mirrored = device.position == .front
+            let dimensions = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription)
+            let initialSize = CGSize(
+                width: CGFloat(dimensions.width),
+                height: CGFloat(dimensions.height)
+            )
 
             DispatchQueue.main.async {
                 guard self.isCurrent(token) else {
@@ -192,9 +213,17 @@ final class HandProximityDetector: NSObject, ObservableObject {
                     }
                     return
                 }
-                // 先激活分析队列再放行 UI：与帧处理同队列，保证时序
-                self.analysisQueue.async { self.analysisActive = true }
+                // 先激活分析队列再放行 UI：与帧处理同队列，保证时序。
+                // 用摄像头格式比例做初始预览尺寸，避免首帧前撑高后瞬间裁切。
+                self.analysisQueue.async {
+                    self.analysisActive = true
+                    if initialSize.width > 0, initialSize.height > 0 {
+                        self.lastPreviewSize = initialSize
+                        DispatchQueue.main.async { self.previewSize = initialSize }
+                    }
+                }
                 self.isMonitoring = true
+                self.previewMirrored = mirrored
                 self.statusText = "监测中"
             }
         }
@@ -228,21 +257,26 @@ final class HandProximityDetector: NSObject, ObservableObject {
             self.lastProcessedUp = 0
             self.lastPixelBuffer = nil
             self.lastFrameMeta = [:]
+            self.lastPreviewSize = .zero
         }
     }
 
     // MARK: - 帧处理
 
     /// 从 Vision 结果里取手部关键点的包围盒对角线，作为唯一的尺度信号。
-    private func measure(_ pixelBuffer: CVPixelBuffer) -> (span: CGFloat, confidence: Float, handCount: Int) {
+    /// box 使用 Vision 归一化坐标（原点左下角），供菜单栏预览叠加识别框。
+    private func measure(_ pixelBuffer: CVPixelBuffer) -> (
+        span: CGFloat, confidence: Float, handCount: Int, box: CGRect
+    ) {
         do {
             try visionHandler.perform([handRequest], on: pixelBuffer, orientation: .up)
         } catch {
-            return (0, 0, 0)
+            return (0, 0, 0, .zero)
         }
 
         var bestSpan: CGFloat = 0
         var bestConfidence: Float = 0
+        var bestBox: CGRect = .zero
         var count = 0
 
         for hand in handRequest.results ?? [] {
@@ -261,14 +295,17 @@ final class HandProximityDetector: NSObject, ObservableObject {
             if span > bestSpan {
                 bestSpan = span
                 bestConfidence = confidence
+                bestBox = CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
             }
         }
 
-        return (bestSpan, bestConfidence, count)
+        return (bestSpan, bestConfidence, count, bestBox)
     }
 
     /// 唯一的判定逻辑：尺寸达标连续 N 帧即报警，回落到释放线以下才解锁。
-    private func evaluate(span: CGFloat, confidence: Float, handCount: Int) {
+    private func evaluate(
+        span: CGFloat, confidence: Float, handCount: Int, box: CGRect
+    ) {
         let threshold = currentThreshold()
         let strength = min(max(span / threshold, 0), 1)
         let now = Self.uptimeNanos()
@@ -317,6 +354,8 @@ final class HandProximityDetector: NSObject, ObservableObject {
             guard let self else { return }
             self.detectionStrength = strength
             self.isClose = close
+            self.detectedBox = box
+            self.handCount = handCount
             self.stateText = state
             if fired { self.onTrigger?(strength) }
         }
@@ -374,7 +413,21 @@ extension HandProximityDetector: AVCaptureVideoDataOutputSampleBufferDelegate {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         lastPixelBuffer = pixelBuffer
 
+        let size = CGSize(
+            width: CGFloat(CVPixelBufferGetWidth(pixelBuffer)),
+            height: CGFloat(CVPixelBufferGetHeight(pixelBuffer))
+        )
+        if size.width > 0, size.height > 0, size != lastPreviewSize {
+            lastPreviewSize = size
+            DispatchQueue.main.async { [weak self] in self?.previewSize = size }
+        }
+
         let measured = measure(pixelBuffer)
-        evaluate(span: measured.span, confidence: measured.confidence, handCount: measured.handCount)
+        evaluate(
+            span: measured.span,
+            confidence: measured.confidence,
+            handCount: measured.handCount,
+            box: measured.box
+        )
     }
 }

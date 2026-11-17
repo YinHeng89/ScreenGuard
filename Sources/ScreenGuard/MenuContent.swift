@@ -1,5 +1,6 @@
 import AVFoundation
 import AppKit
+import QuartzCore
 import SwiftUI
 
 struct MenuContent: View {
@@ -21,6 +22,8 @@ struct MenuContent: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 11) {
             header
+
+            cameraPreview
 
             HStack(spacing: 8) {
                 Text("检测强度")
@@ -170,6 +173,116 @@ struct MenuContent: View {
         }
     }
 
+    /// 预览高度按摄像头实际比例计算，避免拉伸或裁切。
+    private var previewAspect: CGFloat {
+        let size = detector.previewSize
+        guard size.width > 0, size.height > 0 else { return 16 / 9 }
+        return size.width / size.height
+    }
+
+    /// 实时画面 + 识别框，插在检测强度上方。
+    private var cameraPreview: some View {
+        ZStack(alignment: .topLeading) {
+            Group {
+                if detector.isMonitoring {
+                    CameraPreviewLayer(
+                        session: detector.captureSession,
+                        mirrored: detector.previewMirrored
+                    )
+                } else {
+                    previewPlaceholder
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            previewStatusPill
+            handBoxOverlay
+            handCountPill
+        }
+        .frame(height: 280 / previewAspect)
+        .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .stroke(Color.secondary.opacity(0.18), lineWidth: 1)
+        )
+    }
+
+    private var previewPlaceholder: some View {
+        ZStack {
+            Color(nsColor: .controlBackgroundColor)
+            VStack(spacing: 6) {
+                Image(systemName: "video.slash")
+                    .font(.system(size: 18))
+                    .foregroundStyle(.tertiary)
+                Text("摄像头未启动")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    private var previewStatusPill: some View {
+        HStack(spacing: 5) {
+            Circle()
+                .fill(detector.isClose ? Color.orange : (detector.isMonitoring ? Color.mint : Color.secondary))
+                .frame(width: 5, height: 5)
+            Text(detector.isMonitoring
+                 ? (detector.handCount > 0 ? "已识别手" : "实时画面")
+                 : "未启动")
+        }
+        .font(.system(size: 9, weight: .medium))
+        .foregroundStyle(.white)
+        .padding(.horizontal, 7)
+        .padding(.vertical, 4)
+        .background(Color.black.opacity(0.55))
+        .clipShape(Capsule())
+        .padding(8)
+        .allowsHitTesting(false)
+    }
+
+    @ViewBuilder
+    private var handBoxOverlay: some View {
+        if detector.isMonitoring, detector.detectedBox != .zero {
+            GeometryReader { geo in
+                let box = detector.detectedBox
+                // Vision 坐标原点在左下；预览镜像时 x 需翻转。
+                let x = (detector.previewMirrored ? 1 - box.maxX : box.minX) * geo.size.width
+                let y = (1 - box.maxY) * geo.size.height
+                let width = box.width * geo.size.width
+                let height = box.height * geo.size.height
+                let color: Color = detector.isClose ? .orange : .mint
+
+                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                    .fill(color.opacity(0.08))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 4, style: .continuous)
+                            .stroke(color, lineWidth: 2)
+                    )
+                    .frame(width: width, height: height)
+                    .position(x: x + width / 2, y: y + height / 2)
+            }
+            .allowsHitTesting(false)
+        }
+    }
+
+    private var handCountPill: some View {
+        VStack {
+            Spacer()
+            HStack {
+                Spacer()
+                Text(detector.handCount > 0 ? "手部 \(detector.handCount)" : "未检测到手")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 4)
+                    .background(Color.black.opacity(0.55))
+                    .clipShape(Capsule())
+            }
+        }
+        .padding(8)
+        .allowsHitTesting(false)
+    }
+
     private var header: some View {
         HStack(spacing: 10) {
             ZStack {
@@ -237,5 +350,70 @@ struct MenuContent: View {
             position: .unspecified
         )
         return discovery.devices
+    }
+}
+
+/// 复用 detector 的采集会话做实时预览，不新开摄像头。
+private struct CameraPreviewLayer: NSViewRepresentable {
+    let session: AVCaptureSession
+    let mirrored: Bool
+
+    func makeNSView(context: Context) -> PreviewView {
+        let view = PreviewView()
+        view.bind(session, mirrored: mirrored)
+        return view
+    }
+
+    func updateNSView(_ view: PreviewView, context: Context) {
+        view.bind(session, mirrored: mirrored)
+    }
+
+    final class PreviewView: NSView {
+        private let previewLayer = AVCaptureVideoPreviewLayer()
+        private var desiredMirrored = false
+
+        override init(frame frameRect: NSRect) {
+            super.init(frame: frameRect)
+            setup()
+        }
+
+        required init?(coder: NSCoder) {
+            super.init(coder: coder)
+            setup()
+        }
+
+        private func setup() {
+            wantsLayer = true
+            let container = layer ?? CALayer()
+            container.backgroundColor = NSColor.black.cgColor
+            layer = container
+            previewLayer.videoGravity = .resizeAspectFill
+            container.addSublayer(previewLayer)
+        }
+
+        func bind(_ session: AVCaptureSession, mirrored: Bool) {
+            desiredMirrored = mirrored
+            if previewLayer.session !== session {
+                previewLayer.session = session
+            }
+            applyMirroring()
+        }
+
+        /// 预览层的 connection 在会话启动后才有；layout 时再兜底应用一次。
+        private func applyMirroring() {
+            guard let connection = previewLayer.connection,
+                  connection.isVideoMirroringSupported else { return }
+            if connection.automaticallyAdjustsVideoMirroring
+                || connection.isVideoMirrored != desiredMirrored {
+                connection.automaticallyAdjustsVideoMirroring = false
+                connection.isVideoMirrored = desiredMirrored
+            }
+        }
+
+        override func layout() {
+            super.layout()
+            previewLayer.frame = bounds
+            applyMirroring()
+        }
     }
 }

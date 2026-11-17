@@ -104,8 +104,8 @@ struct MenuPanelBackgroundFixer: NSViewRepresentable {
 
             guard let content = window.contentView else { return }
             func walk(_ view: NSView) {
-                // 面板尺寸约 320×581；只处理覆盖整个面板的背景层，
-                // 避免误伤进度条(190×4)、图标、开关等正常半透明元素。
+                // 面板尺寸约 320×740（含实时预览）；只处理覆盖整个面板的背景层，
+                // 避免误伤预览区(280×~158)、进度条(190×4)、图标、开关等正常半透明元素。
                 if view.frame.width >= 300 && view.frame.height >= 500 {
                     view.alphaValue = 1
                     view.wantsLayer = true

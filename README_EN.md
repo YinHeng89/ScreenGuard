@@ -51,6 +51,7 @@ So ScreenGuard's positioning has become slightly delicate: it guards against **s
 | --- | --- |
 | Visual proximity detection | Apple Vision detects the hand; a single dimension — its size in frame (distance) — decides |
 | Single criterion | Alert when the hand is large enough; 3-frame confirmation and hysteresis, no multi-dimension scoring |
+| Live camera preview | See the camera feed at the top of the settings panel with the Vision bounding box overlaid; front camera is mirrored and the box flips with it |
 | Polished floating card | Dark glass look + purple/cyan gradient + pulsing halo + countdown bar; never steals focus or blocks clicks |
 | Popup never dismissed early | Fixed 4.5s display once triggered, even if the hand moves away; hides only when the countdown ends |
 | Three sensitivity levels | Conservative / Standard / Sensitive, mapped to different size thresholds |
@@ -167,6 +168,7 @@ Click the hand icon in the menu bar:
 | Option | Details |
 | --- | --- |
 | Enable gesture monitoring | Master switch; turning it off stops the camera and clears state |
+| Live camera preview | Camera feed above the strength bar, with detection box and hand count; shows a placeholder until monitoring starts |
 | Detection strength bar | Live hand size vs. threshold; turns orange/pink near trigger |
 | Sensitivity | Conservative / Standard / Sensitive |
 | Reminder interval | 3 / 5 / 8 / 12 seconds |
